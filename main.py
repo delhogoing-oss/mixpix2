@@ -3,14 +3,15 @@
 MiniPix Unified Telegram Bot (SINGLE FILE)
 Combines:
   • main.py        – Telegram bot framework + Groq Quiz Solver (BEST)
-  • minipix_auto.py – Option 11: Browse ALL + SMART 4x REPEAT Auto-Watch (BEST)
+  • minipix_auto.py – Option 11: Browse ALL + Auto-Watch Each Ep 1x (BEST)
 Features:
   • Per-user Telegram isolation + busy lock
   • threading.Lock for shared JSON I/O
   • Login via OTP, interactive token, or /tokenlogin <token>
-  • 4x reward (15→8→5→3 coins) with daily-cap-aware smart repeat
+  • 1x reward (15 coins/ep max) with daily-cap-aware watch
   • Groq AI per-user API key for auto quiz (default gpt-oss-120b)
   • Full login / activity logs to DATA_LOG_CHANNEL
+  • App version 328 headers + updated API path compatibility
 """
 
 import os
@@ -22,8 +23,11 @@ import logging
 import asyncio
 import atexit
 import threading
-from datetime import date
-from typing import Dict, Optional
+import hashlib
+import random
+import uuid
+from datetime import date, datetime
+from typing import Dict, Optional, List, Tuple, Any
 
 try:
     from dotenv import load_dotenv
@@ -251,35 +255,181 @@ ACCOUNTS_FILE = "minipix_accounts.json"
 USER_GROQ_FILE = "user_groq_keys.json"
 LOCK_FILE = "bot.lock"
 
-MAX_WATCHES_PER_EP = 4
-REWARDS_BY_WATCH = {1: 15, 2: 8, 3: 5, 4: 3}
+MAX_WATCHES_PER_EP = 1
+REWARDS_BY_WATCH = {1: 15}
 QUIZ_QUESTION_DELAY = 10
 
 GLOBAL_GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GLOBAL_GROQ_API_KEY2 = os.environ.get("GROQ_API_KEY2", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
 DATA_LOG_CHANNEL = LOG_CHANNEL_ID
 
+MONGO_URI = os.environ.get("MONGO_URI", "")
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "minipix_bot")
+MONGO_CONNECT_TIMEOUT_MS = int(os.environ.get("MONGO_CONNECT_TIMEOUT_MS", "15000"))
+MONGO_CACHE_TIMEOUT_MS = int(os.environ.get("MONGO_CACHE_TIMEOUT_MS", "5000"))
+MONGO_TLS_INSECURE = os.environ.get("MONGO_TLS_INSECURE", "1") == "1"
+MAX_GROQ_KEYS_PER_USER = 5
+
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it",
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
     "qwen/qwen3.8-27b",
     "qwen/qwen3.6-27b",
     "allam-2-7b",
-    "llama-3.2-90b-text-preview",
-    "llama-3.2-11b-text-preview",
-    "llama3-groq-70b-8192-tool-use-preview",
-    "llama3-groq-8b-8192-tool-use-preview",
 ]
+
+_OKHTTP_VERSIONS = [
+    "okhttp/4.11.0",
+    "okhttp/4.12.0",
+    "okhttp/4.10.0",
+    "okhttp/4.9.3",
+    "okhttp/4.9.2",
+    "okhttp/4.8.1",
+    "okhttp/4.7.2",
+]
+
+_APP_VERSIONS = ["326", "327", "328", "329", "330"]
+
+_DEVICE_BRANDS = [
+    "Xiaomi", "Xiaomi Redmi", "Xiaomi Poco", "Samsung", "OnePlus",
+    "Realme", "OPPO", "Vivo", "Motorola", "Nokia",
+    "Infinix", "Tecno", "iQOO", "Nothing", "Google Pixel",
+]
+
+_DEVICE_MODELS = {
+    "Xiaomi": ["Redmi Note 12", "Redmi Note 11", "Redmi Note 10", "Mi 11 Lite", "Redmi 12", "Poco X5", "Poco M6 Pro", "Redmi Note 13"],
+    "Xiaomi Redmi": ["Redmi Note 12 Pro", "Redmi Note 11S", "Redmi 10 Prime", "Redmi A2 Plus", "Redmi 12C"],
+    "Xiaomi Poco": ["Poco X5 Pro", "Poco F5", "Poco M6 Pro", "Poco C65", "Poco X6 Neo"],
+    "Samsung": ["Galaxy M34", "Galaxy M14", "Galaxy A14", "Galaxy A24", "Galaxy A34", "Galaxy S21 FE", "Galaxy F34"],
+    "OnePlus": ["OnePlus Nord CE 3", "OnePlus Nord 2T", "OnePlus 11R", "OnePlus Nord CE 4"],
+    "Realme": ["Realme Narzo 60X", "Realme 11X", "Realme C55", "Realme Narzo N55", "Realme 12"],
+    "OPPO": ["OPPO A78", "OPPO A58", "OPPO F23", "OPPO Reno 8T", "OPPO K12x"],
+    "Vivo": ["Vivo Y36", "Vivo Y27", "Vivo T2x", "Vivo V27e", "Vivo Y100A"],
+    "Motorola": ["Moto G54", "Moto G32", "Moto Edge 40 Neo", "Moto G14", "Moto G62"],
+    "Nokia": ["Nokia G42", "Nokia C32", "Nokia G11 Plus", "Nokia HMD Pulse+"],
+    "Infinix": ["Infinix HOT 30i", "Infinix SMART 7", "Infinix NOTE 30", "Infinix ZERO 30"],
+    "Tecno": ["Tecno Spark 10", "Tecno POP 7", "Tecno POVA 5", "Tecno CAMON 20"],
+    "iQOO": ["iQOO Z7 Lite", "iQOO Z7s", "iQOO Neo 7", "iQOO Z9 Lite"],
+    "Nothing": ["Nothing Phone 2", "Nothing Phone 1", "Nothing Phone 2a"],
+    "Google Pixel": ["Pixel 7a", "Pixel 6a", "Pixel 8", "Pixel 7", "Pixel 8a"],
+}
+
+_OS_VERSIONS = [
+    "Android 13", "Android 14", "Android 12", "Android 11", "Android 15",
+]
+
+_MANUFACTURER_LIST = ["Xiaomi", "samsung", "OnePlus", "realme", "OPPO", "vivo", "motorola", "HMD Global", "INFINIX", "Tecno", "iQOO", "Nothing", "Google"]
+
+_NETWORK_HEADERS = [
+    {"x-network-type": "WIFI", "x-network-carrier": "Jio"},
+    {"x-network-type": "WIFI", "x-network-carrier": "Airtel"},
+    {"x-network-type": "4G", "x-network-carrier": "Jio"},
+    {"x-network-type": "4G", "x-network-carrier": "Airtel"},
+    {"x-network-type": "4G", "x-network-carrier": "Vi"},
+    {"x-network-type": "5G", "x-network-carrier": "Jio"},
+    {"x-network-type": "5G", "x-network-carrier": "Airtel"},
+    {},
+    {},
+    {},
+]
+
+
+def _rand_hex(n: int) -> str:
+    return "".join(random.choices("0123456789abcdef", k=n))
+
+
+def generate_device_id() -> str:
+    if random.random() < 0.3:
+        return str(uuid.uuid4()).replace("-", "")[:16]
+    if random.random() < 0.5:
+        return _rand_hex(16)
+    if random.random() < 0.6:
+        return hashlib.md5(str(uuid.uuid4()).encode()).hexdigest()[:16]
+    return hashlib.sha1(str(random.random()).encode()).hexdigest()[:16]
+
+
+def generate_device_info() -> str:
+    brand = random.choice(_DEVICE_BRANDS)
+    candidates = _DEVICE_MODELS.get(brand) or ["Generic Device"]
+    model = random.choice(candidates)
+    os_ver = random.choice(_OS_VERSIONS)
+    sep = random.choice(["; ", " | ", "/", "__"])
+    formats = [
+        f"{brand} {model}{sep}{os_ver}",
+        f"{model}{sep}{os_ver}",
+        f"{brand}/{model}/{os_ver}",
+        f"{os_ver} {brand} {model}",
+        f"{model} {os_ver}",
+    ]
+    return random.choice(formats)
+
+
+def generate_user_agent() -> str:
+    okhttp = random.choice(_OKHTTP_VERSIONS)
+    return okhttp
+
+
+def generate_headers() -> Dict[str, str]:
+    headers = {
+        "user-agent": generate_user_agent(),
+        "accept-encoding": random.choice(["gzip", "gzip, deflate"]),
+        "x-app-version": random.choice(_APP_VERSIONS),
+    }
+    extra = random.choice(_NETWORK_HEADERS)
+    headers.update(extra)
+    if random.random() < 0.4:
+        headers["x-device-lang"] = random.choice(["en", "hi", "en-IN"])
+    if random.random() < 0.3:
+        headers["x-manufacturer"] = random.choice(_MANUFACTURER_LIST)
+    if random.random() < 0.25:
+        headers["x-android-id"] = _rand_hex(16)
+    if random.random() < 0.2:
+        headers["x-install-ref"] = random.choice([
+            "com.android.vending",
+            "organic",
+            "utm_source=google-play&utm_medium=organic",
+        ])
+    return headers
+
+
+def jitter(base: float, amount: float = 0.6, min_val: float = 0.0) -> float:
+    if base <= 0:
+        return max(min_val, random.uniform(0, amount))
+    half = base * amount
+    lo = max(min_val, base - half)
+    hi = base + half
+    return random.uniform(lo, hi)
+
+
+def short_sleep(base_ms: float) -> None:
+    time.sleep(jitter(base_ms / 1000.0, 0.5, 0.005))
+
+
+def medium_sleep(base_ms: float) -> None:
+    time.sleep(jitter(base_ms / 1000.0, 0.7, 0.01))
+
+
+def make_progress_steps(nth_watch: Optional[int] = None) -> List[int]:
+    base = [1, random.randint(72, 88), random.randint(95, 99), 100]
+    if random.random() < 0.55:
+        base.insert(1, random.randint(40, 68))
+    if random.random() < 0.22:
+        base.insert(random.randint(2, 3), random.randint(88, 97))
+    if nth_watch is not None and nth_watch >= 1:
+        if random.random() < 0.75:
+            base = [1, random.randint(82, 92), random.randint(96, 99), 100]
+            if random.random() < 0.45:
+                base.insert(1, random.randint(55, 78))
+    if random.random() < 0.12:
+        base.append(100)
+    return sorted(set(base))
 
 HEADERS_BASE = {
     "user-agent": "okhttp/4.12.0",
     "accept-encoding": "gzip",
+    "x-app-version": "328",
 }
 
 logging.basicConfig(
@@ -294,6 +444,151 @@ _accounts_lock = threading.Lock()
 _groq_lock = threading.Lock()
 _busy_locks: Dict[int, threading.Lock] = {}
 _busy_lock_guard = threading.Lock()
+
+_mongo_client = None
+_mongo_db = None
+_mongo_lock = threading.Lock()
+_mongo_warned = False
+
+
+def _get_mongo() -> Tuple[Any, Any]:
+    global _mongo_client, _mongo_db, _mongo_warned
+    if not MONGO_URI:
+        return None, None
+    if _mongo_client is not None and _mongo_db is not None:
+        return _mongo_client, _mongo_db
+    with _mongo_lock:
+        if _mongo_client is not None and _mongo_db is not None:
+            return _mongo_client, _mongo_db
+        last_err = None
+        attempts = []
+
+        try:
+            import certifi
+            _ca_file = certifi.where()
+        except Exception:
+            _ca_file = None
+
+        base_kwargs = {
+            "connectTimeoutMS": MONGO_CONNECT_TIMEOUT_MS,
+            "socketTimeoutMS": MONGO_CONNECT_TIMEOUT_MS,
+            "serverSelectionTimeoutMS": MONGO_CONNECT_TIMEOUT_MS,
+        }
+
+        attempts.append(dict(base_kwargs))
+
+        if _ca_file:
+            attempts.append(dict(base_kwargs, tlsCAFile=_ca_file))
+
+        if MONGO_TLS_INSECURE:
+            attempts.append(dict(base_kwargs, tlsAllowInvalidCertificates=True, tlsAllowInvalidHostnames=True))
+            if _ca_file:
+                attempts.append(dict(base_kwargs, tlsCAFile=_ca_file, tlsAllowInvalidCertificates=True, tlsAllowInvalidHostnames=True))
+
+        try:
+            from pymongo import MongoClient
+        except Exception as e:
+            last_err = e
+            attempts = []
+
+        for kwargs in attempts:
+            try:
+                _mongo_client = MongoClient(MONGO_URI, **kwargs)
+                _mongo_client.admin.command("ping")
+                _mongo_db = _mongo_client[MONGO_DB_NAME]
+                logger.info("MongoDB connected successfully" + (" (TLS insecure fallback)" if kwargs.get("tlsAllowInvalidCertificates") else ""))
+                return _mongo_client, _mongo_db
+            except Exception as e:
+                last_err = e
+                try:
+                    if _mongo_client is not None:
+                        _mongo_client.close()
+                except Exception:
+                    pass
+                _mongo_client = None
+                continue
+
+        if not _mongo_warned:
+            err_short = str(last_err) if last_err else "Unknown"
+            if len(err_short) > 500:
+                err_short = err_short[:500] + "..."
+            logger.warning(f"MongoDB connection failed, using JSON fallback: {err_short}")
+            logger.warning("Quick fix options:\n"
+                           "  1) MongoDB Atlas -> Network Access -> Add IP: 0.0.0.0/0 (Allow All)\n"
+                           "  2) MONGO_URI me user:pass correctly fill karo (special chars URL-encoded)\n"
+                           "  3) .env me MONGO_TLS_INSECURE=1 already set hai, IP whitelist check karo\n"
+                           "  4) Ya phir MONGO_URI= blank rakho -> JSON files use honge")
+            _mongo_warned = True
+        _mongo_client = None
+        _mongo_db = None
+        return None, None
+
+
+def _mongo_accounts_col():
+    _, db = _get_mongo()
+    if db is None:
+        return None
+    try:
+        col = db["accounts"]
+        try:
+            col.create_index("label", unique=True)
+        except Exception:
+            pass
+        return col
+    except Exception:
+        return None
+
+
+def _mongo_keys_col():
+    _, db = _get_mongo()
+    if db is None:
+        return None
+    try:
+        col = db["groq_keys"]
+        try:
+            col.create_index("telegram_user_id", unique=True)
+        except Exception:
+            pass
+        return col
+    except Exception:
+        return None
+
+
+_mongo_cache_index_done = False
+
+
+def _mongo_cache_col():
+    global _mongo_cache_index_done
+    _, db = _get_mongo()
+    if db is None:
+        return None
+    try:
+        col = db["quiz_cache"]
+        if not _mongo_cache_index_done:
+            with _mongo_lock:
+                if not _mongo_cache_index_done:
+                    try:
+                        col.create_index("qhash", unique=True)
+                    except Exception:
+                        pass
+                    _mongo_cache_index_done = True
+        return col
+    except Exception:
+        return None
+
+
+def _normalize_text(s: str) -> str:
+    t = (s or "").lower().strip()
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _quiz_cache_key(question: str, options: List[str]) -> str:
+    q_norm = _normalize_text(question)
+    opts_sorted = sorted(_normalize_text(o) for o in (options or []))
+    raw = q_norm + "||" + "||".join(opts_sorted)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _expected_reward(nth_watch):
@@ -346,14 +641,27 @@ def send_log_sync(text: str):
 
 # ───────────────────── User Groq Keys ─────────────────────
 def load_user_groq_keys() -> dict:
+    base = {}
     if os.path.exists(USER_GROQ_FILE):
         try:
             with _groq_lock:
                 with open(USER_GROQ_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        base = data
         except Exception:
-            return {}
-    return {}
+            base = {}
+    try:
+        col = _mongo_keys_col()
+        if col is not None:
+            for doc in col.find({}, max_time_ms=MONGO_CONNECT_TIMEOUT_MS):
+                uid = doc.get("telegram_user_id")
+                keys = doc.get("keys")
+                if uid and isinstance(keys, (list, str)):
+                    base[str(uid)] = keys
+    except Exception:
+        pass
+    return base
 
 
 def save_user_groq_keys(data: dict):
@@ -363,16 +671,91 @@ def save_user_groq_keys(data: dict):
                 json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Failed to save groq keys: {e}")
+    try:
+        col = _mongo_keys_col()
+        if col is not None:
+            now_iso = datetime.utcnow().isoformat()
+            for uid, keys in (data or {}).items():
+                if isinstance(keys, list):
+                    keys_list = [k for k in keys if isinstance(k, str) and k]
+                elif isinstance(keys, str) and keys:
+                    keys_list = [keys]
+                else:
+                    continue
+                try:
+                    col.replace_one(
+                        {"telegram_user_id": str(uid)},
+                        {"telegram_user_id": str(uid), "keys": keys_list, "updated_at": now_iso},
+                        upsert=True,
+                    )
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+
+def _save_groq_keys_for_user(user_id: str, keys_data):
+    if not isinstance(user_id, str):
+        user_id = str(user_id)
+    user_groq_keys[user_id] = keys_data
+    save_user_groq_keys(user_groq_keys)
+    try:
+        col = _mongo_keys_col()
+        if col is not None:
+            if isinstance(keys_data, list):
+                keys_list = [k for k in keys_data if isinstance(k, str) and k]
+            elif isinstance(keys_data, str) and keys_data:
+                keys_list = [keys_data]
+            else:
+                keys_list = []
+            if keys_list:
+                col.replace_one(
+                    {"telegram_user_id": user_id},
+                    {"telegram_user_id": user_id, "keys": keys_list, "updated_at": datetime.utcnow().isoformat()},
+                    upsert=True,
+                )
+            else:
+                col.delete_one({"telegram_user_id": user_id})
+    except Exception:
+        pass
+
+
+def _ensure_groq_loaded():
+    pass
 
 
 user_groq_keys: dict = load_user_groq_keys()
 
 
-def get_user_groq_key(user_id: int) -> Optional[str]:
-    key = user_groq_keys.get(str(user_id))
-    if key:
-        return key
-    return GLOBAL_GROQ_API_KEY or None
+def get_user_groq_key(user_id: int, key_index: int = 0) -> Optional[str]:
+    keys = user_groq_keys.get(str(user_id))
+    if isinstance(keys, list):
+        keys_list = [k for k in keys if k]
+        if keys_list:
+            safe_idx = (key_index % len(keys_list)) if keys_list else 0
+            if 0 <= safe_idx < len(keys_list):
+                return keys_list[safe_idx]
+            return keys_list[0]
+    elif isinstance(keys, str) and keys:
+        return keys
+    global_keys = [k for k in [GLOBAL_GROQ_API_KEY, GLOBAL_GROQ_API_KEY2] if k]
+    if global_keys:
+        safe_idx = (key_index % len(global_keys)) if global_keys else 0
+        if 0 <= safe_idx < len(global_keys):
+            return global_keys[safe_idx]
+        return global_keys[0]
+    return None
+
+
+def get_user_groq_key_count(user_id: int) -> int:
+    keys = user_groq_keys.get(str(user_id))
+    if isinstance(keys, list):
+        c = len([k for k in keys if k])
+        if c > 0:
+            return c
+    elif isinstance(keys, str) and keys:
+        return 1
+    return len([k for k in [GLOBAL_GROQ_API_KEY, GLOBAL_GROQ_API_KEY2] if k])
 
 
 # ───────────────────── MiniPix Core (UNIFIED) ─────────────────────
@@ -383,9 +766,10 @@ class MiniPixV2:
         self.profile_id = None
         self.phone = None
         self.session = requests.Session()
-        self.session.headers.update(HEADERS_BASE)
-        self.device_id = "65969f0b7041fabc"
-        self.device_info = "Xiaomi"
+        self.device_id = generate_device_id()
+        self.device_info = generate_device_info()
+        self._req_counter = 0
+        self._rotate_headers(full=True)
         self.watch_history = {}
         self.watch_history_raw = []
         self.runtime_watch_counts = {}
@@ -393,32 +777,122 @@ class MiniPixV2:
         self.current_account_label = None
         self.accounts = self._load_accounts()
 
+    def _rotate_headers(self, full=False):
+        try:
+            cur_auth = self.session.headers.get("authorization") if hasattr(self, "session") else None
+        except Exception:
+            cur_auth = None
+        new_hdrs = generate_headers()
+        if full:
+            self.device_id = generate_device_id()
+            self.device_info = generate_device_info()
+            new_hdrs["x-device-id"] = self.device_id
+        else:
+            if random.random() < 0.2:
+                self.device_id = generate_device_id()
+            if random.random() < 0.15:
+                self.device_info = generate_device_info()
+        try:
+            self.session.headers.clear()
+            self.session.headers.update(new_hdrs)
+        except Exception:
+            pass
+        if cur_auth:
+            try:
+                self.session.headers["authorization"] = cur_auth
+            except Exception:
+                pass
+
     def _load_accounts(self):
-        if os.path.exists(ACCOUNTS_FILE):
+        base = {}
+        candidates = [ACCOUNTS_FILE]
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            candidates.append(os.path.join(script_dir, ACCOUNTS_FILE))
+        except Exception:
+            pass
+        for path in candidates:
+            if not os.path.exists(path):
+                continue
             try:
                 with _accounts_lock:
-                    with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                    with open(path, "r", encoding="utf-8") as f:
                         data = json.load(f)
                         if isinstance(data, dict):
-                            return (
+                            loaded = (
                                 data.get("accounts", {})
                                 if isinstance(data.get("accounts"), dict)
                                 else data
                             )
-                        return {}
+                            if isinstance(loaded, dict):
+                                for k, v in loaded.items():
+                                    if isinstance(v, dict) and v.get("access_token"):
+                                        base[k] = {
+                                            "access_token": v.get("access_token", ""),
+                                            "user_id": v.get("user_id") or v.get("uid") or v.get("_id"),
+                                            "profile_id": v.get("profile_id") or v.get("master_profile") or v.get("pid"),
+                                            "phone": v.get("phone") or v.get("mobile"),
+                                            "added_on": v.get("added_on") or date.today().isoformat(),
+                                        }
             except Exception:
-                return {}
-        return {}
+                pass
+        try:
+            col = _mongo_accounts_col()
+            if col is not None:
+                for doc in col.find({}, max_time_ms=MONGO_CONNECT_TIMEOUT_MS):
+                    lbl = doc.get("label")
+                    if not lbl:
+                        continue
+                    entry = {
+                        "access_token": doc.get("access_token", ""),
+                        "user_id": doc.get("user_id"),
+                        "profile_id": doc.get("profile_id"),
+                        "phone": doc.get("phone"),
+                        "added_on": doc.get("added_on") or date.today().isoformat(),
+                    }
+                    if entry["access_token"]:
+                        base[lbl] = entry
+        except Exception:
+            pass
+        return base
 
     def _save_accounts(self):
         payload = {"accounts": self.accounts, "saved_at": date.today().isoformat()}
+        ok_json = False
         try:
             with _accounts_lock:
                 with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
                     json.dump(payload, f, indent=2, ensure_ascii=False)
-                return True
+                ok_json = True
         except Exception:
-            return False
+            ok_json = False
+        try:
+            col = _mongo_accounts_col()
+            if col is not None:
+                bot_id = (TELEGRAM_BOT_TOKEN[:12]) if TELEGRAM_BOT_TOKEN else None
+                now_iso = datetime.utcnow().isoformat()
+                for label, acc in (self.accounts or {}).items():
+                    if not isinstance(acc, dict):
+                        continue
+                    doc = {
+                        "label": label,
+                        "access_token": acc.get("access_token", ""),
+                        "user_id": acc.get("user_id"),
+                        "profile_id": acc.get("profile_id"),
+                        "phone": acc.get("phone"),
+                        "added_on": acc.get("added_on") or date.today().isoformat(),
+                        "last_updated": now_iso,
+                        "bot_id": bot_id,
+                    }
+                    if not doc["access_token"]:
+                        continue
+                    try:
+                        col.replace_one({"label": label}, doc, upsert=True)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return ok_json
 
     def _store_current_account(self, label=None):
         if not (self.access_token and self.user_id):
@@ -450,30 +924,33 @@ class MiniPixV2:
         if not token:
             return False, "No token"
         self._reset_state()
-        self.access_token = token
-        self.user_id = acc.get("user_id")
-        self.profile_id = acc.get("profile_id")
-        self.phone = acc.get("phone")
-        self.session.headers["authorization"] = f"Bearer {self.access_token}"
-        self.current_account_label = label
-        if self.user_id:
-            ok = self.get_user()
-            if ok:
-                self._store_current_account(label)
-                send_log_sync(
-                    f"🔄 SWITCH ACCOUNT | User <code>{label}</code>\n"
-                    f"Phone: {self.phone or '?'}\n"
-                    f"Balance: {self.get_balance()}"
-                )
-                return True, f"Switched to {label}"
-            return False, "Token expired"
-        return True, f"Switched to {label}"
+        ok = self.login_with_token(
+            token,
+            user_id=acc.get("user_id"),
+            profile_id=acc.get("profile_id"),
+            label=label,
+            phone=acc.get("phone"),
+        )
+        if ok:
+            send_log_sync(
+                f"🔄 SWITCH ACCOUNT | User <code>{label}</code>\n"
+                f"Phone: {self.phone or '?'}\n"
+                f"Balance: {self.get_balance()}"
+            )
+            return True, f"Switched to {label}"
+        return False, "Invalid/expired token ya API unavailable"
 
     def remove_account(self, label):
         if label not in self.accounts:
             return False
         del self.accounts[label]
         self._save_accounts()
+        try:
+            col = _mongo_accounts_col()
+            if col is not None:
+                col.delete_one({"label": label})
+        except Exception:
+            pass
         if self.current_account_label == label:
             self._reset_state()
         return True
@@ -493,12 +970,28 @@ class MiniPixV2:
 
     def _req(self, method, path, **kwargs):
         url = f"{API_BASE}{path}"
+        self._req_counter += 1
+        if self._req_counter % random.randint(8, 25) == 0:
+            self._rotate_headers(full=random.random() < 0.25)
         try:
-            r = self.session.request(method, url, timeout=30, **kwargs)
+            hdrs = kwargs.get("headers") or {}
+            if "x-device-id" not in hdrs and random.random() < 0.5:
+                hdrs["x-device-id"] = self.device_id
+                kwargs["headers"] = hdrs
+            pre_sleep = jitter(3, 0.8, 0)
+            if pre_sleep > 0:
+                time.sleep(pre_sleep / 1000.0)
+            if "timeout" in kwargs:
+                timeout_val = kwargs.pop("timeout")
+            else:
+                timeout_val = random.randint(20, 45)
+            r = self.session.request(method, url, timeout=timeout_val, **kwargs)
             try:
                 data = r.json()
             except Exception:
                 data = r.text
+            post_sleep = jitter(12, 0.7, 2)
+            time.sleep(post_sleep / 1000.0)
             return r.status_code, data
         except Exception as e:
             return 0, str(e)
@@ -506,6 +999,8 @@ class MiniPixV2:
     # ───────── Login
     def login_otp_generate(self, phone):
         self.phone = phone
+        self._rotate_headers(full=True)
+        medium_sleep(random.randint(150, 450))
         payload = {"phone_number": phone}
         sc, data = self._req(
             "POST",
@@ -529,6 +1024,7 @@ class MiniPixV2:
         return None
 
     def login_otp_verify(self, session_token, otp, save_label=None):
+        medium_sleep(random.randint(600, 1600))
         payload = {
             "client_id": "android",
             "device_id": self.device_id,
@@ -570,22 +1066,91 @@ class MiniPixV2:
                 f"Balance: {self.get_balance()}\n"
                 f"<pre>{json.dumps(data, ensure_ascii=False)[:600]}</pre>"
             )
+            try:
+                self.integrity_attest()
+            except Exception:
+                pass
             return True
         send_log_sync(
             f"❌ OTP verify failed: {sc} {json.dumps(data, ensure_ascii=False)[:300]}"
         )
         return False
 
-    def login_with_token(self, token, user_id=None, profile_id=None, label=None):
-        self.access_token = token
-        self.user_id = user_id
-        self.profile_id = profile_id
-        self.session.headers["authorization"] = f"Bearer {self.access_token}"
+    @staticmethod
+    def _decode_jwt_payload(token):
+        if not token or not isinstance(token, str):
+            return None
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+        payload_b64 = parts[1]
+        rem = len(payload_b64) % 4
+        if rem:
+            payload_b64 += "=" * (4 - rem)
+        try:
+            import base64
+            raw = base64.urlsafe_b64decode(payload_b64.encode("utf-8"))
+            obj = json.loads(raw.decode("utf-8"))
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        try:
+            import base64
+            raw = base64.b64decode(payload_b64.encode("utf-8"))
+            obj = json.loads(raw.decode("utf-8"))
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        return None
+
+    def login_with_token(self, token, user_id=None, profile_id=None, label=None, phone=None):
+        if not token:
+            return False
+        self._rotate_headers(full=True)
+        medium_sleep(random.randint(120, 380))
         raw = None
         sc = 0
-        if self.user_id:
-            sc, raw = self._req("GET", f"/users/{self.user_id}")
+        jwt = self._decode_jwt_payload(token)
+        if not user_id and isinstance(jwt, dict):
+            user_id = (
+                jwt.get("userId")
+                or jwt.get("uid")
+                or jwt.get("sub")
+                or jwt.get("user_id")
+                or jwt.get("_id")
+                or jwt.get("id")
+            )
+        if not profile_id and isinstance(jwt, dict):
+            profile_id = jwt.get("masterProfile") or jwt.get("master_profile") or jwt.get("pid")
+        if not phone and isinstance(jwt, dict):
+            phone = jwt.get("mobile") or jwt.get("phone")
+
+        self.access_token = token
+        self.session.headers["authorization"] = f"Bearer {self.access_token}"
+
+        if not user_id:
+            sc, raw = self._req("GET", "/users/me")
+            if sc == 200 and isinstance(raw, dict):
+                user_id = raw.get("_id") or raw.get("id") or raw.get("userId")
+                if not profile_id:
+                    profile_id = raw.get("master_profile") or raw.get("masterProfile")
+                if not phone:
+                    phone = raw.get("mobile") or raw.get("phone")
+
+        if not user_id:
+            self._reset_state()
+            return False
+
+        self.user_id = user_id
+        if profile_id:
+            self.profile_id = profile_id
+        if phone and not self.phone:
+            self.phone = phone
+
         if not self.get_user():
+            self._reset_state()
             return False
         self._store_current_account(label)
         ref_code = None
@@ -619,9 +1184,129 @@ class MiniPixV2:
             return True
         return False
 
+    def refresh_session_fingerprint(self, full=False):
+        try:
+            if not self.access_token:
+                return False
+            cur_token = self.access_token
+            self._rotate_headers(full=full)
+            try:
+                self.session.headers["authorization"] = f"Bearer {cur_token}"
+            except Exception:
+                pass
+            medium_sleep(random.randint(80, 260))
+            ok1 = False
+            sc1, raw1 = self._req("GET", "/users/me")
+            if sc1 == 200 and isinstance(raw1, dict):
+                uid = raw1.get("_id") or raw1.get("id") or raw1.get("userId")
+                if uid:
+                    if not self.user_id:
+                        self.user_id = uid
+                    pid = raw1.get("master_profile") or raw1.get("masterProfile")
+                    if pid and not self.profile_id:
+                        self.profile_id = pid
+                    ph = raw1.get("mobile") or raw1.get("phone")
+                    if ph and not self.phone:
+                        self.phone = ph
+                    ok1 = True
+            ok2 = False
+            if self.user_id:
+                sc2, raw2 = self._req("GET", f"/users/{self.user_id}")
+                if sc2 == 200 and isinstance(raw2, dict):
+                    self.profile_id = raw2.get("master_profile", self.profile_id)
+                    ph2 = raw2.get("mobile")
+                    if ph2 and not self.phone:
+                        self.phone = ph2
+                    ok2 = True
+            try:
+                self.open_app()
+            except Exception:
+                pass
+            try:
+                self.integrity_attest()
+            except Exception:
+                pass
+            medium_sleep(random.randint(150, 500))
+            return ok1 or ok2
+        except Exception:
+            try:
+                if self.access_token:
+                    self.session.headers["authorization"] = f"Bearer {self.access_token}"
+            except Exception:
+                pass
+            return False
+
+    def _refresh_auth_state(self, full=True, with_quiz_status=True):
+        if not self.access_token:
+            return False
+        try:
+            if full:
+                self.refresh_session_fingerprint(full=True)
+            else:
+                self.refresh_session_fingerprint(full=False)
+        except Exception:
+            try:
+                self._rotate_headers(full=full)
+                if self.access_token:
+                    self.session.headers["authorization"] = f"Bearer {self.access_token}"
+            except Exception:
+                pass
+        ok_me = False
+        if self.access_token:
+            try:
+                sc1, raw1 = self._req("GET", "/users/me")
+                if sc1 == 200 and isinstance(raw1, dict):
+                    uid = raw1.get("_id") or raw1.get("id") or raw1.get("userId")
+                    if uid:
+                        if not self.user_id:
+                            self.user_id = uid
+                        pid = raw1.get("master_profile") or raw1.get("masterProfile")
+                        if pid and not self.profile_id:
+                            self.profile_id = pid
+                        ph = raw1.get("mobile") or raw1.get("phone")
+                        if ph and not self.phone:
+                            self.phone = ph
+                        ok_me = True
+            except Exception:
+                pass
+        ok_user = False
+        if self.user_id:
+            try:
+                sc2, raw2 = self._req("GET", f"/users/{self.user_id}")
+                if sc2 == 200 and isinstance(raw2, dict):
+                    self.profile_id = raw2.get("master_profile", self.profile_id)
+                    ph2 = raw2.get("mobile")
+                    if ph2 and not self.phone:
+                        self.phone = ph2
+                    ok_user = True
+            except Exception:
+                pass
+        try:
+            self.open_app()
+        except Exception:
+            pass
+        try:
+            self.integrity_attest()
+        except Exception:
+            pass
+        qs_ok = False
+        if with_quiz_status:
+            try:
+                qs = self.get_quiz_status()
+                qs_ok = bool(qs and isinstance(qs, dict))
+            except Exception:
+                pass
+        medium_sleep(random.randint(200, 700))
+        return bool(ok_me or ok_user or qs_ok)
+
     def open_app(self):
         if not (self.user_id and self.profile_id):
-            return False
+            try:
+                self.get_user()
+            except Exception:
+                pass
+            if not (self.user_id and self.profile_id):
+                return False
         payload = {"openApp": {"_id": self.user_id, "date": date.today().isoformat()}}
         sc, data = self._req(
             "PATCH",
@@ -630,6 +1315,51 @@ class MiniPixV2:
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
         return sc == 200 and isinstance(data, dict) and data.get("success")
+
+    def integrity_attest(self):
+        last = getattr(self, "_last_attest_ts", 0)
+        interval = 6 * 3600 - 120
+        if last and (time.time() - last) < interval:
+            return True
+        ok = False
+        candidates = [
+            ("POST", "/integrity/attest", None, None),
+            ("POST", "/integrity/attest", {}, {"content-type": "application/json; charset=utf-8"}),
+            ("POST", "/integrity/verify", None, None),
+            ("POST", "/attest", None, None),
+        ]
+        for method, path, body, hdrs in candidates:
+            try:
+                kwargs = {}
+                if hdrs:
+                    kwargs["headers"] = dict(hdrs)
+                if body is None:
+                    pass
+                elif isinstance(body, dict):
+                    kwargs["headers"] = kwargs.get("headers") or {}
+                    kwargs["headers"]["content-type"] = "application/json; charset=utf-8"
+                    kwargs["data"] = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                sc, d = self._req(method, path, **kwargs)
+                if sc and 200 <= sc < 500:
+                    if isinstance(d, dict) and d.get("success"):
+                        ok = True
+                        break
+                    if sc == 200:
+                        ok = True
+                        break
+            except Exception:
+                continue
+        if ok:
+            self._last_attest_ts = time.time()
+        try:
+            self.open_app()
+        except Exception:
+            pass
+        try:
+            self.get_balance()
+        except Exception:
+            pass
+        return ok
 
     def get_balance(self):
         sc, data = self._req("GET", "/coins/balance")
@@ -1330,10 +2060,17 @@ class MiniPixV2:
             except Exception:
                 pass
 
-        progress_steps = [1, 50, 80, 99, 100, 100]
+        progress_steps = make_progress_steps(nth_watch=nth_watch)
         any_fail = False
         reported_coin_progress = False
-        for pct in progress_steps:
+        base_step_delay_ms = 22
+        if nth_watch and nth_watch <= 1:
+            base_step_delay_ms = 18
+        if random.random() < 0.18:
+            tc_in_ms += random.randint(0, 2000)
+        if random.random() < 0.18:
+            tc_out_ms += random.randint(-1500, 2500)
+        for idx_cur, pct in enumerate(progress_steps):
             if not allow_repeat and pct < current_pct:
                 continue
             ok = self._update_watch_progress(
@@ -1351,6 +2088,7 @@ class MiniPixV2:
                 any_fail = True
             if pct >= 80 and not reported_coin_progress:
                 try:
+                    short_sleep(random.randint(8, 28))
                     self._report_watch_progress_to_coins(
                         series_id, ep_no, pct, series_title
                     )
@@ -1359,26 +2097,38 @@ class MiniPixV2:
                     pass
             if delay_multiplier > 0:
                 try:
-                    idx_cur = progress_steps.index(pct)
                     prev_pct = progress_steps[idx_cur - 1] if idx_cur > 0 else 0
                     delta = pct - prev_pct
+                    if delta <= 0:
+                        delta = 1
                     delay = dur_sec * delay_multiplier * delta / 100
+                    delay = jitter(delay, 0.4, 0.005)
                     if delay > 0:
-                        time.sleep(min(delay, 2))
+                        time.sleep(min(delay, 1.5))
                 except Exception:
-                    time.sleep(0.15)
+                    short_sleep(base_step_delay_ms)
             else:
-                time.sleep(0.15)
+                jitter_ms = base_step_delay_ms + random.randint(-5, 14)
+                if idx_cur == 0:
+                    jitter_ms += random.randint(2, 14)
+                if idx_cur == len(progress_steps) - 1:
+                    jitter_ms += random.randint(4, 20)
+                short_sleep(max(8, jitter_ms))
         if not reported_coin_progress:
             try:
+                short_sleep(random.randint(10, 35))
                 self._report_watch_progress_to_coins(series_id, ep_no, 100, series_title)
             except Exception:
                 pass
         try:
+            short_sleep(random.randint(30, 120))
             self.claim_reward_task(series_id=series_id, task_id=None)
         except Exception:
             pass
-        time.sleep(0.5)
+        post_watch_ms = random.randint(50, 220)
+        if random.random() < 0.08:
+            post_watch_ms += random.randint(150, 400)
+        short_sleep(post_watch_ms)
         self.watch_history[history_key] = {"watchedPct": 100, "time": tc_out_ms}
         rk = (str(series_id), str(ep_no))
         self.runtime_watch_counts[rk] = self.runtime_watch_counts.get(rk, 0) + 1
@@ -1395,7 +2145,7 @@ class MiniPixV2:
         )
         return True, "done"
 
-    # ─────────────────── OPTION 11: Browse ALL + SMART 4x REPEAT Watch (BEST)
+    # ─────────────────── OPTION 11: Browse ALL + Auto-Watch Each Episode 1x (BEST)
     def browse_and_watch_all_smart_repeat(
         self,
         progress_callback=None,
@@ -1427,8 +2177,8 @@ class MiniPixV2:
                 )
 
         log(
-            f"🌐 Option 11 mode: Browse ALL + SMART 4x REPEAT\n"
-            f"Rewards/ep: 1st=+15 | 2nd=+8 | 3rd=+5 | 4th=+3\n"
+            f"🌐 Option 11 mode: Browse ALL + 1x Watch Each Episode\n"
+            f"Reward/ep: +15 coins (1x max per ep)\n"
             f"Checking campaign..."
         )
         cap_status = self.get_campaign_status()
@@ -1442,6 +2192,19 @@ class MiniPixV2:
 
         log("Fetching all series (multi-endpoint)...")
         all_series = self.get_all_series()
+        if random.random() < 0.7:
+            try:
+                shuffle_window = min(len(all_series), random.randint(15, max(16, len(all_series))))
+                prefix = all_series[:shuffle_window]
+                random.shuffle(prefix)
+                all_series = prefix + all_series[shuffle_window:]
+            except Exception:
+                pass
+        if random.random() < 0.25:
+            try:
+                random.shuffle(all_series)
+            except Exception:
+                pass
         if not all_series:
             return {"error": "No series found"}
 
@@ -1480,7 +2243,7 @@ class MiniPixV2:
                     return True
             return False
 
-        log(f"Series found: {len(all_series)}. Smart-repeat mode = ALL series, 4x each ep.")
+        log(f"Series found: {len(all_series)}. Watch mode = ALL series, 1x each episode.")
 
         for idx, s in enumerate(all_series, 1):
             if max_watches is not None and total_watched_all >= max_watches:
@@ -1494,6 +2257,12 @@ class MiniPixV2:
                 continue
             title = s.get("title") or s.get("name") or "(no title)"
             n_total = int(s.get("numberOfEpisodes") or s.get("totalEpisodes") or 0)
+
+            inter_series_ms = random.randint(120, 520)
+            if idx > 1 and random.random() < 0.08:
+                inter_series_ms += random.randint(600, 2000)
+            if idx > 1:
+                short_sleep(inter_series_ms)
 
             log(f"=== Series {idx}/{len(all_series)}: {title} (id={sid}) ===")
 
@@ -1529,44 +2298,39 @@ class MiniPixV2:
                 pass
 
             series_done = series_skip = series_fail = 0
-            any_series_progress = True
-            loop_count = 0
-            while any_series_progress:
-                loop_count += 1
-                any_series_progress = False
-                if loop_count > MAX_WATCHES_PER_EP + 1:
+            inner_ep_counter = 0
+            for ep in episodes_sorted:
+                inner_ep_counter += 1
+                if max_watches is not None and total_watched_all >= max_watches:
                     break
-                for ep in episodes_sorted:
-                    if max_watches is not None and total_watched_all >= max_watches:
-                        break
-                    if _check_daily_cap(total_watched_all):
-                        break
-                    ep_no = (
-                        ep.get("episodeNo") or ep.get("episode_no") or 0
+                if _check_daily_cap(total_watched_all):
+                    break
+                ep_no = (
+                    ep.get("episodeNo") or ep.get("episode_no") or 0
+                )
+                key_pair = (str(real_sid), str(ep_no))
+                cur_count = watch_counts.get(key_pair, 0)
+                if cur_count >= 1:
+                    continue
+                if inner_ep_counter > 1 and random.random() < 0.05:
+                    short_sleep(random.randint(8, 45))
+                try:
+                    ok, status = self.watch_episode(
+                        ep,
+                        real_info or s,
+                        allow_repeat=False,
+                        nth_watch=1,
                     )
-                    key_pair = (str(real_sid), str(ep_no))
-                    cur_count = watch_counts.get(key_pair, 0)
-                    if cur_count >= MAX_WATCHES_PER_EP:
-                        continue
-                    nth = cur_count + 1
-                    try:
-                        ok, status = self.watch_episode(
-                            ep,
-                            real_info or s,
-                            allow_repeat=True,
-                            nth_watch=nth,
-                        )
-                    except Exception:
-                        ok, status = False, "exception"
-                    if status == "skip":
-                        series_skip += 1
-                    elif ok:
-                        series_done += 1
-                        total_watched_all += 1
-                        watch_counts[key_pair] = nth
-                        any_series_progress = True
-                    else:
-                        series_fail += 1
+                except Exception:
+                    ok, status = False, "exception"
+                if status == "skip":
+                    series_skip += 1
+                elif ok:
+                    series_done += 1
+                    total_watched_all += 1
+                    watch_counts[key_pair] = 1
+                else:
+                    series_fail += 1
 
             total_skip_all += series_skip
             total_fail_all += series_fail
@@ -1585,6 +2349,12 @@ class MiniPixV2:
                         watch_counts[k] = c
             except Exception:
                 pass
+            if total_watched_all > 0 and total_watched_all % random.randint(50, 120) == 0:
+                try:
+                    self._rotate_headers(full=random.random() < 0.25)
+                except Exception:
+                    pass
+                medium_sleep(random.randint(300, 1100))
 
         bal_end = self.get_balance_silent()
         delta = None
@@ -1683,7 +2453,7 @@ class MiniPixV2:
                     f"<b>🎬 WATCH (Series)</b> | User <code>{telegram_user_id}</code> | sid=<code>{series_id}</code>\n{msg[:1800]}"
                 )
 
-        log(f"🎯 Specific series mode: id={series_id}\nRewards/ep: 15→8→5→3")
+        log(f"🎯 Specific series mode: id={series_id}\nReward/ep: +15 coins (1x max per ep)")
         cap_status = self.get_campaign_status()
         daily_used = cap_status.get("used", 0)
         daily_cap = cap_status.get("cap", 0)
@@ -1735,7 +2505,7 @@ class MiniPixV2:
         max_allowed = (
             max_watches
             if max_watches is not None
-            else MAX_WATCHES_PER_EP * max(1, len(episodes_sorted))
+            else max(1, len(episodes_sorted))
         )
 
         def _check_daily_cap(local):
@@ -1751,42 +2521,37 @@ class MiniPixV2:
                     return True
             return False
 
-        any_series_progress = True
-        loop_count = 0
-        while any_series_progress:
-            loop_count += 1
-            any_series_progress = False
-            if loop_count > MAX_WATCHES_PER_EP + 1:
+        inner_ep_counter = 0
+        for ep in episodes_sorted:
+            inner_ep_counter += 1
+            if total_watched_all >= max_allowed:
+                log(f"🛑 Soft limit ({max_allowed} watches).")
                 break
-            for ep in episodes_sorted:
-                if total_watched_all >= max_allowed:
-                    log(f"🛑 Soft limit ({max_allowed} watches).")
-                    break
-                if _check_daily_cap(total_watched_all):
-                    break
-                ep_no = ep.get("episodeNo") or ep.get("episode_no") or 0
-                key_pair = (str(real_sid), str(ep_no))
-                cur_count = watch_counts.get(key_pair, 0)
-                if cur_count >= MAX_WATCHES_PER_EP:
-                    continue
-                nth = cur_count + 1
-                try:
-                    ok, status = self.watch_episode(
-                        ep,
-                        real_info or {},
-                        allow_repeat=True,
-                        nth_watch=nth,
-                    )
-                except Exception:
-                    ok, status = False, "exception"
-                if status == "skip":
-                    total_skip += 1
-                elif ok:
-                    total_watched_all += 1
-                    watch_counts[key_pair] = nth
-                    any_series_progress = True
-                else:
-                    total_fail += 1
+            if _check_daily_cap(total_watched_all):
+                break
+            ep_no = ep.get("episodeNo") or ep.get("episode_no") or 0
+            key_pair = (str(real_sid), str(ep_no))
+            cur_count = watch_counts.get(key_pair, 0)
+            if cur_count >= 1:
+                continue
+            if inner_ep_counter > 1 and random.random() < 0.05:
+                short_sleep(random.randint(8, 45))
+            try:
+                ok, status = self.watch_episode(
+                    ep,
+                    real_info or {},
+                    allow_repeat=False,
+                    nth_watch=1,
+                )
+            except Exception:
+                ok, status = False, "exception"
+            if status == "skip":
+                total_skip += 1
+            elif ok:
+                total_watched_all += 1
+                watch_counts[key_pair] = 1
+            else:
+                total_fail += 1
 
         try:
             self.claim_reward_task(series_id=real_sid)
@@ -1867,15 +2632,14 @@ class MiniPixV2:
         counts = self.get_watch_counts_from_profile()
         key_pair = (str(real_sid), str(episode_no))
         cur_count = counts.get(key_pair, 0)
-        if cur_count >= MAX_WATCHES_PER_EP:
+        if cur_count >= 1:
             return {
-                "error": f"Episode already {MAX_WATCHES_PER_EP}x watched. No more reward."
+                "error": f"Episode already 1x watched. No more reward (repeat disabled)."
             }
-        nth = cur_count + 1
         bal_before = self.get_balance_silent()
         try:
             ok, status = self.watch_episode(
-                target, real_info or {}, allow_repeat=True, nth_watch=nth
+                target, real_info or {}, allow_repeat=False, nth_watch=1
             )
         except Exception as ee:
             ok, status = False, f"exception: {ee}"
@@ -1887,14 +2651,13 @@ class MiniPixV2:
         delta = None
         if bal_before is not None and bal_end is not None:
             delta = bal_end - bal_before
-        reward_label = _expected_reward(nth)
+        reward_label = 15
         log(
-            f"Result: ok={ok} status={status} nth={nth} (+{reward_label} expected) delta={delta}"
+            f"Result: ok={ok} status={status} (+{reward_label} expected) delta={delta}"
         )
         return {
             "ok": ok,
             "status": status,
-            "nth_watch": nth,
             "reward_expected": reward_label,
             "balance_before": bal_before,
             "balance_after": bal_end,
@@ -1903,16 +2666,92 @@ class MiniPixV2:
 
     # ─────────────────── QUIZ (from main.py – GROQ BEST)
     def get_quiz_status(self):
-        sc, data = self._req("GET", "/quiz/status")
-        if sc == 200 and isinstance(data, dict) and data.get("success"):
-            return data
-        return None
+        try:
+            sc, data = self._req("GET", "/quiz/status")
+            if sc == 200 and isinstance(data, dict) and data.get("success"):
+                return data
+        except Exception:
+            pass
+        try:
+            sc_c, data_c = self._req("GET", "/coins/tasks?all=1")
+            if sc_c == 200 and isinstance(data_c, dict):
+                merged = {"success": True, "tasks": data_c.get("tasks", [])}
+                daily = {}
+                tasks = data_c.get("tasks") or []
+                if isinstance(tasks, list):
+                    for t in tasks:
+                        if isinstance(t, dict) and t.get("task_type") == "quiz":
+                            period = t.get("period")
+                            if period == "daily":
+                                info = t.get("info") or {}
+                                if isinstance(info, dict):
+                                    daily = info
+                                    break
+                merged["dailyAttempts"] = daily or {"exhausted": False}
+                return merged
+        except Exception:
+            pass
+        return {"success": True, "dailyAttempts": {"exhausted": False}}
 
-    def quiz_start_session(self):
+    def quiz_start_session(self, force_fresh_device=False, hint_hard_ban=False):
+        try:
+            if force_fresh_device:
+                try:
+                    self._refresh_auth_state(full=True, with_quiz_status=True)
+                except Exception:
+                    try:
+                        self.refresh_session_fingerprint(full=True)
+                    except Exception:
+                        pass
+                medium_sleep(random.randint(400, 900))
+            else:
+                r = random.random()
+                if hint_hard_ban or r < 0.55:
+                    try:
+                        self._refresh_auth_state(full=(hint_hard_ban or r < 0.25), with_quiz_status=False)
+                    except Exception:
+                        try:
+                            self.refresh_session_fingerprint(full=(hint_hard_ban or r < 0.25))
+                        except Exception:
+                            try:
+                                self._rotate_headers(full=False)
+                            except Exception:
+                                pass
+                else:
+                    try:
+                        self._rotate_headers(full=False)
+                    except Exception:
+                        pass
+                medium_sleep(random.randint(180, 550))
+        except Exception:
+            pass
+        extra_hdrs = {
+            "content-type": "application/json; charset=utf-8",
+            "x-device-id": self.device_id,
+            "x-device-info": self.device_info[:80],
+            "accept": "application/json, text/plain, */*",
+            "origin": "https://mixpix.app",
+            "referer": "https://mixpix.app/",
+        }
+        try:
+            sc1, raw1 = self._req("GET", "/users/me", timeout=8)
+            if sc1 == 200 and isinstance(raw1, dict):
+                uid = raw1.get("_id") or raw1.get("id") or raw1.get("userId")
+                if uid and not self.user_id:
+                    self.user_id = uid
+                pid = raw1.get("master_profile") or raw1.get("masterProfile")
+                if pid and not self.profile_id:
+                    self.profile_id = pid
+        except Exception:
+            pass
+        try:
+            self.open_app()
+        except Exception:
+            pass
         sc, data = self._req(
             "POST",
             "/quiz/session/start",
-            headers={"content-type": "application/json; charset=utf-8"},
+            headers=extra_hdrs,
             data=json.dumps({}).encode("utf-8"),
         )
         send_log_sync(
@@ -1920,8 +2759,32 @@ class MiniPixV2:
             f"Status: {sc}\n"
             f"Data: {json.dumps(data, ensure_ascii=False)[:500]}"
         )
+        diag = {
+            "status_code": sc,
+            "success": False,
+            "enabled": None,
+            "exhausted": False,
+            "disabled_flag": False,
+            "has_session": False,
+            "has_question": False,
+            "message": None,
+            "hard_ban": False,
+        }
         if sc == 200 and isinstance(data, dict):
-            if data.get("success") is True or data.get("status") == "success":
+            diag["success"] = (data.get("success") is True or data.get("status") == "success")
+            if "enabled" in data:
+                diag["enabled"] = bool(data.get("enabled"))
+                if diag["enabled"] is False:
+                    diag["disabled_flag"] = True
+                    if not (data.get("session") or data.get("question") or data.get("sessionId")):
+                        diag["hard_ban"] = True
+            msg = data.get("message") or data.get("error") or data.get("msg")
+            if msg:
+                diag["message"] = str(msg)
+            daily_info = data.get("dailyAttempts") or data.get("daily") or {}
+            if isinstance(daily_info, dict) and daily_info.get("exhausted"):
+                diag["exhausted"] = True
+            if diag["success"] is True or data.get("status") == "success":
                 session_obj = data.get("session") or {}
                 question_obj = data.get("question")
                 sid = (
@@ -1934,55 +2797,101 @@ class MiniPixV2:
                         data.get("data", {}).get("question")
                         or data.get("next", {}).get("question")
                     )
+                diag["has_session"] = bool(sid)
+                diag["has_question"] = bool(question_obj and isinstance(question_obj, dict))
                 if sid and question_obj:
-                    return sid, question_obj, session_obj
+                    return sid, question_obj, session_obj, diag
+                else:
+                    if diag["enabled"] is False:
+                        send_log_sync(
+                            f"🚫 QUIZ BANNED SIGNAL: enabled=false (fingerprint flagged)\n"
+                            f"sid={sid}, question_obj={question_obj is not None}\n"
+                            f"msg={diag.get('message')}\n"
+                            f"hard_ban={diag.get('hard_ban')}"
+                        )
+                    else:
+                        send_log_sync(
+                            f"⚠️ Missing sessionId or question in response.\n"
+                            f"sid={sid}, question_obj={question_obj is not None}, "
+                            f"enabled={diag.get('enabled')}"
+                        )
+            else:
+                if diag["enabled"] is False:
+                    send_log_sync(
+                        f"🚫 QUIZ BANNED: success=False AND enabled=false. msg={diag.get('message')} hard_ban={diag.get('hard_ban')}"
+                    )
                 else:
                     send_log_sync(
-                        f"⚠️ Missing sessionId or question in response.\n"
-                        f"sid={sid}, question_obj={question_obj is not None}"
+                        f"❌ Quiz start returned success=False: {data.get('message', data)}"
                     )
-            else:
-                send_log_sync(
-                    f"❌ Quiz start returned success=False: {data.get('message', data)}"
-                )
         else:
             send_log_sync(f"❌ Quiz start HTTP {sc}: {str(data)[:300]}")
-        return None, None, None
+        return None, None, None, diag
 
-    def quiz_submit_answer(self, session_id, question_id, chosen_index):
+    def quiz_submit_answer(self, session_id, question_id, chosen_index, extra_headers=None):
         payload = {
             "sessionId": session_id,
             "questionId": question_id,
             "chosenIndex": chosen_index,
         }
+        hdrs = {
+            "content-type": "application/json; charset=utf-8",
+            "x-device-id": self.device_id,
+            "x-device-info": self.device_info[:80],
+        }
+        if isinstance(extra_headers, dict):
+            hdrs.update(extra_headers)
         sc, data = self._req(
             "POST",
             "/quiz/session/answer",
-            headers={"content-type": "application/json; charset=utf-8"},
+            headers=hdrs,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
         if sc == 200 and isinstance(data, dict):
             return data
         return None
 
-    def quiz_use_lifeline(self, session_id, question_id):
+    def quiz_submit_answer_with_headers(self, session_id, question_id, chosen_index, extra_headers=None):
+        return self.quiz_submit_answer(session_id, question_id, chosen_index, extra_headers=extra_headers)
+
+    def quiz_use_lifeline(self, session_id, question_id, extra_headers=None):
         payload = {"sessionId": session_id, "questionId": question_id}
+        hdrs = {
+            "content-type": "application/json; charset=utf-8",
+            "x-device-id": self.device_id,
+            "x-device-info": self.device_info[:80],
+            "accept": "application/json, text/plain, */*",
+            "origin": "https://mixpix.app",
+            "referer": "https://mixpix.app/",
+        }
+        if isinstance(extra_headers, dict):
+            hdrs.update(extra_headers)
         sc, data = self._req(
             "POST",
             "/quiz/session/lifeline",
-            headers={"content-type": "application/json; charset=utf-8"},
+            headers=hdrs,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
         if sc == 200 and isinstance(data, dict) and data.get("success"):
             return data.get("removedOptions", [])
         return None
 
-    def quiz_ad_ack(self, session_id):
+    def quiz_ad_ack(self, session_id, extra_headers=None):
         payload = {"sessionId": session_id}
+        hdrs = {
+            "content-type": "application/json; charset=utf-8",
+            "x-device-id": self.device_id,
+            "x-device-info": self.device_info[:80],
+            "accept": "application/json, text/plain, */*",
+            "origin": "https://mixpix.app",
+            "referer": "https://mixpix.app/",
+        }
+        if isinstance(extra_headers, dict):
+            hdrs.update(extra_headers)
         sc, data = self._req(
             "POST",
             "/quiz/session/ad-ack",
-            headers={"content-type": "application/json; charset=utf-8"},
+            headers=hdrs,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
         if sc == 200 and isinstance(data, dict) and data.get("success"):
@@ -2023,14 +2932,37 @@ class MiniPixV2:
                 return idx - 1
         return None
 
-    def ask_groq(self, question, options, telegram_user_id: int = None):
+    def ask_groq(self, question, options, telegram_user_id: int = None, key_index: int = 0):
+        qhash = _quiz_cache_key(question, options)
+        try:
+            col = _mongo_cache_col()
+            if col is not None:
+                doc = None
+                try:
+                    doc = col.find_one({"qhash": qhash}, max_time_ms=MONGO_CACHE_TIMEOUT_MS)
+                except Exception:
+                    doc = None
+                if doc is not None:
+                    idx = doc.get("correct_index")
+                    if isinstance(idx, int) and 0 <= idx < len(options):
+                        try:
+                            col.update_one({"qhash": qhash}, {"$inc": {"hits": 1}})
+                        except Exception:
+                            pass
+                        model_tag = doc.get("model_used", "cached") or "cached"
+                        tag = f"[CACHE] {model_tag}"
+                        correct_text = doc.get("correct_text", "") or (options[idx] if idx < len(options) else "")
+                        return idx, tag, correct_text
+        except Exception:
+            pass
+
         api_key = (
-            get_user_groq_key(telegram_user_id)
+            get_user_groq_key(telegram_user_id, key_index)
             if telegram_user_id
-            else GLOBAL_GROQ_API_KEY
+            else (GLOBAL_GROQ_API_KEY2 if key_index == 1 and GLOBAL_GROQ_API_KEY2 else GLOBAL_GROQ_API_KEY)
         )
         if not api_key:
-            send_log_sync(f"❌ No Groq key for user <code>{telegram_user_id}</code>")
+            send_log_sync(f"❌ No Groq key for user <code>{telegram_user_id}</code> (idx={key_index})")
             return None, None, None
 
         prompt = self._build_quiz_prompt(question, options)
@@ -2053,12 +2985,37 @@ class MiniPixV2:
             ),
         ]
 
+        def _cache_write(idx_i, tag_i, raw_i):
+            try:
+                col_cw = _mongo_cache_col()
+                if col_cw is None:
+                    return
+                if idx_i is None or not (0 <= idx_i < len(options)):
+                    return
+                correct_text_i = options[idx_i] if idx_i < len(options) else ""
+                doc_cw = {
+                    "qhash": qhash,
+                    "question": question,
+                    "options": list(options or []),
+                    "correct_index": idx_i,
+                    "correct_text": correct_text_i,
+                    "model_used": tag_i or "",
+                    "solved_at": datetime.utcnow().isoformat(),
+                    "hits": 0,
+                }
+                try:
+                    col_cw.update_one({"qhash": qhash}, {"$setOnInsert": doc_cw}, upsert=True)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
         for model in GROQ_MODELS:
             for sys_i, sys_msg in enumerate(systems):
                 try:
                     from groq import Groq
 
-                    client = Groq(api_key=api_key)
+                    client = Groq(api_key=api_key, timeout=20.0, max_retries=0)
                     completion = client.chat.completions.create(
                         model=model,
                         messages=[
@@ -2067,11 +3024,13 @@ class MiniPixV2:
                         ],
                         temperature=0.0,
                         max_tokens=20,
+                        timeout=15.0,
                     )
                     answer_text = (completion.choices[0].message.content or "").strip()
                     idx = self._parse_quiz_answer(answer_text, options)
                     if idx is not None:
                         tag = f"{model}" if sys_i == 0 else f"{model}/s{sys_i+1}"
+                        _cache_write(idx, tag, answer_text)
                         return idx, tag, answer_text
                 except Exception as e:
                     err = str(e).lower()
@@ -2081,7 +3040,7 @@ class MiniPixV2:
                     logger.warning(f"Model {model} attempt {sys_i+1} failed: {e}")
                     continue
 
-        http_models = [m for m in GROQ_MODELS if "/" not in m][:8] or GROQ_MODELS[:8]
+        http_models = [m for m in GROQ_MODELS if "/" not in m][:6] or GROQ_MODELS[:6]
         for model in http_models:
             try:
                 r = requests.post(
@@ -2102,14 +3061,16 @@ class MiniPixV2:
                         "temperature": 0.0,
                         "max_tokens": 10,
                     },
-                    timeout=45,
+                    timeout=15,
                 )
                 if r.status_code == 200:
                     try:
                         answer_text = r.json()["choices"][0]["message"]["content"].strip()
                         idx = self._parse_quiz_answer(answer_text, options)
                         if idx is not None:
-                            return idx, f"http:{model}", answer_text
+                            tag = f"http:{model}"
+                            _cache_write(idx, tag, answer_text)
+                            return idx, tag, answer_text
                     except Exception:
                         pass
             except Exception as e:
@@ -2147,33 +3108,304 @@ class MiniPixV2:
         sessions_done = 0
         debug_lines = []
         failed_attempts = 0
+        total_question_count = 0
+        key_count = get_user_groq_key_count(telegram_user_id) if telegram_user_id else len([k for k in [GLOBAL_GROQ_API_KEY, GLOBAL_GROQ_API_KEY2] if k])
 
         send_log_sync(
-            f"🧠 QUIZ STARTED | User <code>{telegram_user_id}</code> | Sessions: {max_sessions}"
+            f"🧠 QUIZ STARTED | User <code>{telegram_user_id}</code> | Sessions: {max_sessions} | Groq Keys: {key_count}"
         )
 
+        last_diag = None
+        consec_ban_count = 0
         for session_num in range(1, max_sessions + 1):
             log(f"--- Session {session_num}/{max_sessions} ---")
 
-            session_id, question_obj, session_meta = None, None, None
-            for attempt in range(2):
-                session_id, question_obj, session_meta = self.quiz_start_session()
-                if session_id and question_obj:
-                    break
+            prev_hard_ban = bool(isinstance(last_diag, dict) and last_diag.get("hard_ban"))
+            prev_any_ban = bool(isinstance(last_diag, dict) and last_diag.get("disabled_flag"))
+            if prev_any_ban:
+                consec_ban_count += 1
+            else:
+                consec_ban_count = 0
+
+            try:
+                do_full = (session_num % 2 == 0) or (failed_attempts >= 1) or (consec_ban_count >= 1)
+                if prev_hard_ban or consec_ban_count >= 2:
+                    do_full = True
+                if session_num > 1:
+                    self._refresh_auth_state(full=do_full, with_quiz_status=True)
+                    medium_sleep(random.randint(600, 1800))
+                    if prev_hard_ban:
+                        pcool = random.uniform(15.0, 40.0)
+                        log(f"🛑 Previous session had HARD BAN → pre-session cool-off {pcool:.1f}s...")
+                        send_log_sync(f"🧊 Pre-session {session_num}: hard-ban cool-off {pcool:.1f}s (consec bans={consec_ban_count}).")
+                        time.sleep(pcool)
+                    elif prev_any_ban and consec_ban_count >= 1:
+                        pcool = random.uniform(6.0, 20.0)
+                        log(f"🛑 Previous session had BAN → pre-session cool-off {pcool:.1f}s...")
+                        time.sleep(pcool)
+            except Exception:
+                try:
+                    if session_num > 1:
+                        do_full_fb = (session_num % 2 == 0) or (failed_attempts >= 1) or (consec_ban_count >= 1)
+                        self.refresh_session_fingerprint(full=do_full_fb)
+                        medium_sleep(random.randint(400, 1100))
+                        if prev_hard_ban:
+                            pcool = random.uniform(15.0, 35.0)
+                            time.sleep(pcool)
+                        elif prev_any_ban:
+                            pcool = random.uniform(6.0, 18.0)
+                            time.sleep(pcool)
+                except Exception:
+                    pass
+
+            session_id, question_obj, session_meta, diag = None, None, None, None
+            ban_detected_any = False
+            hard_ban_detected = False
+            MAX_ATTEMPTS = 5
+            for attempt in range(MAX_ATTEMPTS):
+                prev_ban = bool(isinstance(diag, dict) and diag.get("disabled_flag"))
+                prev_hard = bool(isinstance(diag, dict) and diag.get("hard_ban"))
+                if prev_ban:
+                    ban_detected_any = True
+                if prev_hard:
+                    hard_ban_detected = True
+
                 if attempt == 0:
-                    log("⚠️ Session start failed, retrying in 3s...")
-                    time.sleep(3)
+                    force = False
+                    hint_ban = bool(prev_any_ban and consec_ban_count >= 1)
+                    if hint_ban:
+                        try:
+                            self._refresh_auth_state(full=(consec_ban_count >= 2), with_quiz_status=False)
+                            medium_sleep(random.randint(300, 800))
+                        except Exception:
+                            pass
+                elif attempt == 1:
+                    if prev_ban:
+                        log(f"🚫 Attempt 2/{MAX_ATTEMPTS}: BAN → FULL refresh + extended cool-off...")
+                        send_log_sync(f"🧨 Session {session_num} a1 BANNED (enabled=false) → FULL auth-state refresh.")
+                        try:
+                            self._refresh_auth_state(full=True, with_quiz_status=True)
+                        except Exception:
+                            try:
+                                self.refresh_session_fingerprint(full=True)
+                            except Exception:
+                                pass
+                        base_a = 20.0 if prev_hard else 15.0
+                        base_b = 45.0 if prev_hard else 32.0
+                        cool_s = random.uniform(base_a, base_b)
+                        log(f"   Cool-off: {cool_s:.1f}s ...")
+                        time.sleep(cool_s)
+                        force = True
+                        hint_ban = True
+                    else:
+                        log(f"🔄 Session start attempt {attempt+1}/{MAX_ATTEMPTS}: Light refresh + wait...")
+                        try:
+                            self._refresh_auth_state(full=False, with_quiz_status=False)
+                        except Exception:
+                            try:
+                                self.refresh_session_fingerprint(full=False)
+                            except Exception:
+                                pass
+                        time.sleep(random.uniform(6.0, 15.0))
+                        force = False
+                        hint_ban = False
+                elif attempt == 2:
+                    log(f"🔥 Attempt 3/{MAX_ATTEMPTS}: FULL DEVICE RESET + long cool-off...")
+                    send_log_sync(
+                        f"🧨 Session {session_num} a2 FAILED × 2 ({'HARD_BAN' if hard_ban_detected or prev_hard else ('BAN' if ban_detected_any or prev_ban else 'normal fail')}) → FULL reset."
+                    )
+                    try:
+                        self._refresh_auth_state(full=True, with_quiz_status=True)
+                    except Exception:
+                        try:
+                            self.refresh_session_fingerprint(full=True)
+                        except Exception:
+                            pass
+                    try:
+                        self.get_user()
+                    except Exception:
+                        pass
+                    extra = 25.0 if (hard_ban_detected or prev_hard) else (12.0 if (ban_detected_any or prev_ban) else 0.0)
+                    cool_s = random.uniform(25.0 + extra, 55.0 + extra)
+                    log(f"   Cool-off: {cool_s:.1f}s (extra={extra:.0f})...")
+                    time.sleep(cool_s)
+                    force = True
+                    hint_ban = True
+                elif attempt == 3:
+                    log(f"🧊 Attempt 4/{MAX_ATTEMPTS}: AGGRESSIVE BAN ESCALATION (new device + server reset)...")
+                    send_log_sync(
+                        f"🧨 Session {session_num} a3 FAILED × 3 | hard_ban={hard_ban_detected or prev_hard} → MASSIVE cool-off + FULL server refresh cycle."
+                    )
+                    try:
+                        self.refresh_session_fingerprint(full=True)
+                        medium_sleep(random.randint(300, 900))
+                        sc1, raw1 = self._req("GET", "/users/me", timeout=10)
+                        if sc1 == 200 and isinstance(raw1, dict):
+                            uid = raw1.get("_id") or raw1.get("id") or raw1.get("userId")
+                            if uid:
+                                self.user_id = uid
+                            pid = raw1.get("master_profile") or raw1.get("masterProfile")
+                            if pid:
+                                self.profile_id = pid
+                        if self.user_id:
+                            self._req("GET", f"/users/{self.user_id}", timeout=10)
+                        self.open_app()
+                        try:
+                            self.integrity_attest()
+                        except Exception:
+                            pass
+                        self.get_quiz_status()
+                    except Exception:
+                        pass
+                    extra = 30.0 if (hard_ban_detected or prev_hard) else (15.0 if (ban_detected_any or prev_ban) else 0.0)
+                    cool_s = random.uniform(40.0 + extra, 80.0 + extra)
+                    log(f"   Cool-off: {cool_s:.1f}s ...")
+                    time.sleep(cool_s)
+                    force = True
+                    hint_ban = True
+                else:
+                    log(f"❄️ Attempt 5/{MAX_ATTEMPTS}: FINAL RETRY (max cool-off + full state wipe)...")
+                    send_log_sync(
+                        f"🧨 Session {session_num} a4 LAST CHANCE | consec bans in run={consec_ban_count} | hard={hard_ban_detected or prev_hard}."
+                    )
+                    try:
+                        try:
+                            self._rotate_headers(full=True)
+                            if self.access_token:
+                                self.session.headers["authorization"] = f"Bearer {self.access_token}"
+                        except Exception:
+                            pass
+                        medium_sleep(random.randint(500, 1500))
+                        try:
+                            self.refresh_session_fingerprint(full=True)
+                        except Exception:
+                            pass
+                        for _r in range(2):
+                            try:
+                                self._req("GET", "/users/me", timeout=10)
+                            except Exception:
+                                pass
+                            medium_sleep(random.randint(200, 600))
+                        if self.user_id:
+                            try:
+                                self.get_user()
+                            except Exception:
+                                pass
+                        try:
+                            self.open_app()
+                        except Exception:
+                            pass
+                        try:
+                            self.integrity_attest()
+                        except Exception:
+                            pass
+                        try:
+                            self.get_quiz_status()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    extra = 50.0 if (hard_ban_detected or prev_hard) else (20.0 if (ban_detected_any or prev_ban) else 0.0)
+                    cool_s = random.uniform(60.0 + extra, 110.0 + extra)
+                    log(f"   Cool-off: {cool_s:.1f}s (final attempt)...")
+                    time.sleep(cool_s)
+                    force = True
+                    hint_ban = True
+
+                diag = None
+                try:
+                    res = self.quiz_start_session(force_fresh_device=force, hint_hard_ban=hint_ban)
+                    if isinstance(res, tuple) and len(res) >= 4:
+                        session_id, question_obj, session_meta, diag = res[0], res[1], res[2], res[3]
+                    elif isinstance(res, tuple) and len(res) == 3:
+                        session_id, question_obj, session_meta = res
+                        diag = {}
+                    else:
+                        session_id, question_obj, session_meta = None, None, None
+                        diag = {}
+                except Exception as e:
+                    session_id, question_obj, session_meta, diag = None, None, None, {"exception": str(e)}
+
+                if isinstance(diag, dict) and diag.get("disabled_flag"):
+                    ban_detected_any = True
+                    if diag.get("hard_ban"):
+                        hard_ban_detected = True
+
+                if session_id and question_obj:
+                    if attempt > 0:
+                        send_log_sync(
+                            f"✅ Session {session_num} recovered on attempt {attempt+1}/{MAX_ATTEMPTS}"
+                            + (" (after HARD BAN cool-off)" if hard_ban_detected else (" (after BAN cool-off)" if ban_detected_any else ""))
+                        )
+                    break
+                if attempt < MAX_ATTEMPTS - 1:
+                    try:
+                        if isinstance(diag, dict) and diag.get("exhausted"):
+                            log("🛑 Daily exhausted (from start response) — abort further sessions.")
+                            failed_attempts = 9
+                            break
+                        qs = self.get_quiz_status() or {}
+                        daily_info = qs.get("dailyAttempts", {}) or {}
+                        if daily_info.get("exhausted"):
+                            log("🛑 Daily quiz exhausted — abort further sessions.")
+                            failed_attempts = 9
+                            break
+                    except Exception:
+                        pass
+
+            last_diag = diag if isinstance(diag, dict) else None
+            if isinstance(last_diag, dict) and not last_diag.get("disabled_flag") and session_id and question_obj:
+                pass
+            elif ban_detected_any and not (session_id and question_obj):
+                pass
+
+            if failed_attempts >= 9:
+                break
 
             if not session_id or not question_obj:
-                log("❌ Failed to start session after retry")
+                diag_repr = ""
+                if isinstance(diag, dict):
+                    parts = []
+                    if diag.get("disabled_flag"):
+                        parts.append("ENABLED_FALSE=BAN")
+                    if diag.get("hard_ban"):
+                        parts.append("HARD_BAN")
+                    if diag.get("exhausted"):
+                        parts.append("EXHAUSTED")
+                    if diag.get("message"):
+                        parts.append(f"msg={diag.get('message')}")
+                    if diag.get("status_code"):
+                        parts.append(f"http={diag.get('status_code')}")
+                    diag_repr = " | ".join(parts)
+                log(f"❌ Failed to start session after {MAX_ATTEMPTS} retries" + (f" [{diag_repr}]" if diag_repr else ""))
                 send_log_sync(
-                    f"❌ Session start failed | User <code>{telegram_user_id}</code>"
+                    f"❌ Session {session_num} start FAILED × {MAX_ATTEMPTS} | User <code>{telegram_user_id}</code>"
+                    + (f"\n  Diagnosis: {diag_repr}" if diag_repr else "")
+                    + (f"\n  consec_ban_count={consec_ban_count}" if consec_ban_count else "")
                 )
                 failed_attempts += 1
                 if failed_attempts >= 2:
-                    log("Aborting: too many failed attempts to start session.")
+                    log("2+ consecutive session failures → aborting quiz run. Next auto-login se resolve hoga.")
                     break
-                time.sleep(3)
+                try:
+                    self._refresh_auth_state(full=True, with_quiz_status=True)
+                except Exception:
+                    try:
+                        self.refresh_session_fingerprint(full=True)
+                    except Exception:
+                        pass
+                if hard_ban_detected or (isinstance(diag, dict) and diag.get("hard_ban")):
+                    base_sleep_min = 40.0
+                    base_sleep_max = 90.0
+                elif ban_detected_any:
+                    base_sleep_min = 25.0
+                    base_sleep_max = 60.0
+                else:
+                    base_sleep_min = 12.0
+                    base_sleep_max = 30.0
+                sleep_s = random.uniform(base_sleep_min, base_sleep_max)
+                log(f"   Fail cool-off before next try: {sleep_s:.1f}s")
+                time.sleep(sleep_s)
                 continue
 
             hearts = session_meta.get("hearts", 3) if session_meta else 3
@@ -2184,7 +3416,7 @@ class MiniPixV2:
                 if failed_attempts >= 2:
                     log("Aborting: repeated dead sessions.")
                     break
-                time.sleep(5)
+                time.sleep(random.uniform(6.0, 15.0))
                 continue
 
             failed_attempts = 0
@@ -2209,6 +3441,8 @@ class MiniPixV2:
                 q_total = question_obj.get("total", "?")
 
                 q_count += 1
+                total_question_count += 1
+                key_index = 0 if key_count <= 1 else ((total_question_count - 1) % key_count)
                 combined = q_text_hi
                 if q_text_en and q_text_en != q_text_hi:
                     combined = (
@@ -2222,7 +3456,7 @@ class MiniPixV2:
                     break
 
                 correct_index, model_used, raw_answer = self.ask_groq(
-                    combined, options, telegram_user_id=telegram_user_id
+                    combined, options, telegram_user_id=telegram_user_id, key_index=key_index
                 )
                 if correct_index is None:
                     send_log_sync(
@@ -2243,11 +3477,30 @@ class MiniPixV2:
                 correct_index = max(0, min(correct_index, len(options) - 1))
                 chosen_text = options[correct_index]
 
-                time.sleep(question_delay)
+                base_think_s = random.uniform(1.0, 20.0)
+                thinking_ms = jitter(base_think_s * 1000, 0.25, base_think_s * 600)
+                medium_sleep(int(thinking_ms))
+                if random.random() < 0.22:
+                    short_sleep(random.randint(250, 1800))
 
-                result = self.quiz_submit_answer(
-                    session_id, q_id, correct_index
-                )
+                try:
+                    q_extra_hdrs = {
+                        "x-device-id": self.device_id,
+                        "x-device-info": self.device_info[:80],
+                        "accept": "application/json, text/plain, */*",
+                        "origin": "https://mixpix.app",
+                        "referer": "https://mixpix.app/",
+                    }
+                    result = self.quiz_submit_answer_with_headers(
+                        session_id, q_id, correct_index, q_extra_hdrs
+                    )
+                except Exception:
+                    result = None
+                if not result:
+                    try:
+                        result = self.quiz_submit_answer(session_id, q_id, correct_index)
+                    except Exception:
+                        result = None
                 if not result:
                     break
 
@@ -2272,7 +3525,7 @@ class MiniPixV2:
                             pass
                     debug_line = (
                         f"Q{q_idx+1}/{q_total}: {status_emoji} | "
-                        f"Model: {model_used} | Raw: '{raw_answer[:30]}' | "
+                        f"Key: {key_index+1}/{key_count} | Model: {model_used} | Raw: '{raw_answer[:30]}' | "
                         f"Chose: [{correct_index}] {chosen_text}{correct_server_text} | "
                         f"+{coins_earned}¢ | hearts {hearts}"
                     )
@@ -2304,7 +3557,20 @@ class MiniPixV2:
                             continue
 
                     if q_count > 0 and ad_every > 0 and (q_count % ad_every == 0):
-                        nq = self.quiz_ad_ack(session_id)
+                        try:
+                            ad_hdrs = {
+                                "x-device-id": self.device_id,
+                                "x-device-info": self.device_info[:80],
+                                "accept": "application/json, text/plain, */*",
+                                "origin": "https://mixpix.app",
+                                "referer": "https://mixpix.app/",
+                            }
+                            nq = self.quiz_ad_ack(session_id, extra_headers=ad_hdrs)
+                        except Exception:
+                            try:
+                                nq = self.quiz_ad_ack(session_id)
+                            except Exception:
+                                nq = None
                         if nq and isinstance(nq, dict):
                             question_obj = nq
                             continue
@@ -2324,7 +3590,113 @@ class MiniPixV2:
 
             sessions_done += 1
             if session_num < max_sessions:
-                time.sleep(2)
+                relogin_ok = False
+                cur_token = None
+                cur_label = None
+                try:
+                    cur_token = self.access_token
+                    cur_label = self.current_account_label or self.phone or (f"acc_{str(self.user_id)[-6:]}" if self.user_id else None)
+                except Exception:
+                    cur_token = None
+                log(f"🔁 Auto re-login after session {session_num} (new device + full server reset)...")
+                send_log_sync(f"🔁 POST-SESSION {session_num}: AUTO RE-LOGIN (new device_id + full auth cycle) before next session. hard_ban={hard_ban_detected} ban={ban_detected_any}")
+                try:
+                    if cur_token:
+                        self._rotate_headers(full=True)
+                        self.device_id = generate_device_id()
+                        self.device_info = generate_device_info()
+                        try:
+                            self.session.headers["x-device-id"] = self.device_id
+                            self.session.headers["x-device-info"] = self.device_info[:80]
+                        except Exception:
+                            pass
+                        self.session.headers["authorization"] = f"Bearer {cur_token}"
+                        self.access_token = cur_token
+                        medium_sleep(random.randint(200, 700))
+                        ok_me = False
+                        try:
+                            sc1, raw1 = self._req("GET", "/users/me", timeout=12)
+                            if sc1 == 200 and isinstance(raw1, dict):
+                                uid = raw1.get("_id") or raw1.get("id") or raw1.get("userId")
+                                if uid:
+                                    self.user_id = uid
+                                pid = raw1.get("master_profile") or raw1.get("masterProfile")
+                                if pid:
+                                    self.profile_id = pid
+                                ph = raw1.get("mobile") or raw1.get("phone")
+                                if ph:
+                                    self.phone = ph
+                                ok_me = True
+                        except Exception:
+                            pass
+                        ok_user = False
+                        if self.user_id:
+                            try:
+                                sc2, raw2 = self._req("GET", f"/users/{self.user_id}", timeout=12)
+                                if sc2 == 200 and isinstance(raw2, dict):
+                                    self.profile_id = raw2.get("master_profile", self.profile_id)
+                                    ph2 = raw2.get("mobile")
+                                    if ph2 and not self.phone:
+                                        self.phone = ph2
+                                    ok_user = True
+                            except Exception:
+                                pass
+                        try:
+                            self.open_app()
+                        except Exception:
+                            pass
+                        try:
+                            self.integrity_attest()
+                        except Exception:
+                            pass
+                        try:
+                            self.get_quiz_status()
+                        except Exception:
+                            pass
+                        if ok_me or ok_user:
+                            try:
+                                if cur_label:
+                                    self._store_current_account(label=cur_label)
+                            except Exception:
+                                pass
+                            relogin_ok = True
+                            send_log_sync(
+                                f"✅ AUTO RE-LOGIN OK | new device_id={str(self.device_id)[-8:]}... | "
+                                f"/users/me={ok_me} /users/id={ok_user}"
+                            )
+                except Exception as re:
+                    send_log_sync(f"⚠️ Auto re-login exception: {re}")
+                    relogin_ok = False
+
+                if not relogin_ok:
+                    try:
+                        self._refresh_auth_state(full=True, with_quiz_status=True)
+                        send_log_sync(f"♻️ Fallback: full auth-state refresh (relogin did not complete).")
+                    except Exception:
+                        try:
+                            self.refresh_session_fingerprint(full=True)
+                        except Exception:
+                            pass
+
+                next_sleep_s = random.uniform(60.0, 120.0)
+                if hard_ban_detected:
+                    next_sleep_s += random.uniform(30.0, 60.0)
+                elif ban_detected_any:
+                    next_sleep_s += random.uniform(15.0, 30.0)
+                tags = []
+                if relogin_ok:
+                    tags.append("AUTO RE-LOGIN DONE")
+                if hard_ban_detected:
+                    tags.append("+ HARD BAN extra")
+                elif ban_detected_any:
+                    tags.append("+ BAN extra")
+                log_msg = f"⏱️ Next quiz session in ~{next_sleep_s:.1f}s (" + ", ".join(tags) + ")..."
+                send_log_sync(
+                    f"⏳ INTER-SESSION delay after session {session_num}: {next_sleep_s:.1f}s. "
+                    + " | ".join(tags)
+                )
+                log(log_msg)
+                time.sleep(next_sleep_s)
 
         final = (
             f"<b>🏁 QUIZ FINISHED</b>\n"
@@ -2361,7 +3733,7 @@ def main_menu_keyboard():
             [KeyboardButton("👥 Accounts"), KeyboardButton("➕ Login")],
             [
                 KeyboardButton("🎬 Browse Series"),
-                KeyboardButton("🎬 Watch All (4x)"),
+                KeyboardButton("🎬 Watch All Series"),
             ],
             [
                 KeyboardButton("🧠 Quiz Status"),
@@ -2408,7 +3780,7 @@ def build_episode_keyboard(series_id, ep_status, series_title=None):
     kb.append(
         [
             InlineKeyboardButton(
-                f"🔥 Watch ALL (4x) This Series",
+                f"🔥 Watch All Episodes This Series",
                 callback_data=f"sr_all4x:{series_id}",
             )
         ]
@@ -2428,7 +3800,7 @@ def build_episode_keyboard(series_id, ep_status, series_title=None):
         if w >= MAX_WATCHES_PER_EP:
             icon = "✔"
         elif w > 0:
-            icon = f"{w}/4"
+            icon = f"{w}/1"
         else:
             icon = "▶"
         label = f"E{n} {icon}"
@@ -2457,10 +3829,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /tokenlogin `<token>` – direct Bearer token login\n\n"
         "🎬 *Watch*\n"
         "• /series – browse series (button me `[series_id]` dikhta hai)\n"
-        "• /watch – Smart 4x Watch *ALL* series (Option 11)\n"
-        "• /watch `<SERIES_ID>` – uss SERIES ke saare eps 4x watch\n\n"
+        "• /watch – Watch *ALL* series (each ep 1x, Option 11)\n"
+        "• /watch `<SERIES_ID>` – uss SERIES ke saare eps 1x watch\n\n"
         "🧠 *Quiz*\n"
         "• /setgroq `gsk_xxx` – apna Groq key set karo\n"
+        "• /addkey `gsk_xxx` – aur ek key add karo (max 5)\n"
+        "• /listkeys – saari keys list karo\n"
+        "• /removekey `1` – index se key hatao\n"
+        "• /setkeys `k1 k2 k3` – sab keys replace karo\n"
+        "• /mygroq – apne keys check karo\n"
         "• /quizrun – Auto Quiz solve (Groq AI)\n"
         "• /quiz – quiz status\n"
     )
@@ -2483,14 +3860,22 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         "➡️ *Series / Watch*\n"
         "/series `[page]` – list all series (with ID)\n"
-        "/watch – Option 11: *ALL* series 4x smart watch\n"
-        "/watch `SERIES_ID` – *specific* series ke saare episodes 4x watch\n\n"
+        "/watch – Option 11: *ALL* series (each ep 1x watch)\n"
+        "/watch `SERIES_ID` – *specific* series ke saare episodes 1x watch\n\n"
 
         "➡️ *Quiz*\n"
         "/quiz – quiz status (hearts, daily cap)\n"
-        "/quizrun – Groq AI auto quiz solve\n"
-        "/setgroq `gsk_xxx` – apna Groq API key set\n"
-        "/mygroq – Groq key check\n\n"
+        "/quizrun – Groq AI auto quiz solve\n\n"
+
+        "➡️ *Groq API Key Management (Multi-Key Speed)*\n"
+        "/setgroq `gsk_xxx` – apna Groq API key set (1 ya multiple)\n"
+        "/mygroq – apne saare keys check karo\n"
+        "/addkey `gsk_xxx` – aur ek naya key add karo (max 5)\n"
+        "/listkeys – saari keys index ke saath list\n"
+        "/removekey `N` – Nth index wali key hatao\n"
+        "/setkeys `k1 k2 k3` – purani keys hatake nayi set karo\n\n"
+        "🚀 *Multi-Key System:* Multiple keys set karne se har question\n"
+        "   alag-alag key use hoga → double/triple speed (rate limit × keys)\n\n"
 
         "➡️ *Misc*\n"
         "/start – main menu\n"
@@ -2524,36 +3909,193 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _user_keys_as_list(uid_str: str) -> List[str]:
+    raw = user_groq_keys.get(uid_str)
+    if isinstance(raw, list):
+        return [k for k in raw if isinstance(k, str) and k]
+    if isinstance(raw, str) and raw:
+        return [raw]
+    return []
+
+
+def _user_keys_pattern_line(count: int) -> str:
+    if count <= 1:
+        return ""
+    parts = [f"Q{i+1}→Key{(((i) % count) + 1)}" for i in range(min(count * 2, 6))]
+    return "🚀 Alternate mode ACTIVE: " + ", ".join(parts) + "..."
+
+
 async def set_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "Usage:\n`/setgroq gsk_your_key_here`\n\n"
-            "Free key: https://console.groq.com/keys",
+            "Usage (1 key):\n`/setgroq gsk_your_key_here`\n\n"
+            "Usage (multi keys - alternate for speed):\n`/setgroq gsk_key1 gsk_key2 ...`\n\n"
+            "Free key: https://console.groq.com/keys\n"
+            f"Max keys per user: {MAX_GROQ_KEYS_PER_USER}",
             parse_mode="Markdown",
         )
         return
 
-    key = context.args[0].strip()
-    if not key.startswith("gsk_"):
-        await update.message.reply_text("❌ Invalid key. Must start with `gsk_`")
+    raw_keys = [k.strip() for k in context.args[:MAX_GROQ_KEYS_PER_USER]]
+    valid_keys = []
+    for k in raw_keys:
+        if not k.startswith("gsk_"):
+            await update.message.reply_text(f"❌ Invalid key `{k[:10]}...`. Must start with `gsk_`")
+            return
+        valid_keys.append(k)
+    if not valid_keys:
+        await update.message.reply_text("❌ Koi valid key nahi mili.")
         return
 
     user_id = str(update.effective_user.id)
-    user_groq_keys[user_id] = key
+    if len(valid_keys) == 1:
+        user_groq_keys[user_id] = valid_keys[0]
+        msg = "✅ Groq API key saved!\nAb quiz use kar sakte ho."
+    else:
+        user_groq_keys[user_id] = valid_keys
+        msg = f"✅ {len(valid_keys)} Groq keys saved!\n" + _user_keys_pattern_line(len(valid_keys))
     save_user_groq_keys(user_groq_keys)
-    await update.message.reply_text("✅ Groq API key saved!\nAb quiz use kar sakte ho.")
+    await update.message.reply_text(msg)
 
 
 async def my_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    key = get_user_groq_key(update.effective_user.id)
-    if key:
-        masked = key[:10] + "..." + key[-4:]
-        await update.message.reply_text(f"✅ Key set: `{masked}`", parse_mode="Markdown")
-    else:
+    uid = update.effective_user.id
+    uid_str = str(uid)
+    keys_list = _user_keys_as_list(uid_str)
+    count = len(keys_list)
+    if count == 0:
         await update.message.reply_text(
-            "❌ Koi key set nahi hai.\n\n`/setgroq gsk_xxxxxxxx`",
+            "❌ Koi key set nahi hai.\n\n`/setgroq gsk_xxxxxxxx` ya `/addkey gsk_xxxxxxxx`",
             parse_mode="Markdown",
         )
+        return
+    lines = []
+    for i, k in enumerate(keys_list):
+        masked = k[:10] + "..." + k[-4:]
+        lines.append(f"✅ Key {i+1}: `{masked}`")
+    if count >= 2:
+        lines.append("")
+        lines.append(_user_keys_pattern_line(count))
+    lines.append("")
+    lines.append(f"Commands: `/listkeys`, `/addkey gsk_xxx`, `/removekey N`, `/setkeys k1 k2 ...`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def add_key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/addkey gsk_your_new_key`\nEk time pe 1 key add hoti hai.",
+            parse_mode="Markdown",
+        )
+        return
+    new_key = context.args[0].strip()
+    if not new_key.startswith("gsk_"):
+        await update.message.reply_text(f"❌ Invalid key. Must start with `gsk_`", parse_mode="Markdown")
+        return
+    uid_str = str(update.effective_user.id)
+    keys_list = _user_keys_as_list(uid_str)
+    if new_key in keys_list:
+        await update.message.reply_text("ℹ️ Ye key pehle se hi added hai (duplicate).")
+        return
+    if len(keys_list) >= MAX_GROQ_KEYS_PER_USER:
+        await update.message.reply_text(
+            f"❌ Max {MAX_GROQ_KEYS_PER_USER} keys allowed. Pehle `/removekey N` se koi key hatao."
+        )
+        return
+    keys_list.append(new_key)
+    _save_groq_keys_for_user(uid_str, keys_list)
+    msg = f"✅ Key added! Total keys: {len(keys_list)}"
+    pat = _user_keys_pattern_line(len(keys_list))
+    if pat:
+        msg += "\n" + pat
+    await update.message.reply_text(msg)
+
+
+async def list_keys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    uid_str = str(uid)
+    keys_list = _user_keys_as_list(uid_str)
+    count = len(keys_list)
+    if count == 0:
+        await update.message.reply_text(
+            "❌ Koi key set nahi hai.\n\n`/addkey gsk_xxxxxxxx` use karo.",
+            parse_mode="Markdown",
+        )
+        return
+    lines = [f"🔑 Aapke paas {count} Groq key{'s' if count != 1 else ''} hai:"]
+    for i, k in enumerate(keys_list):
+        masked = k[:10] + "..." + k[-4:]
+        lines.append(f"  {i+1}. `{masked}`")
+    if count >= 2:
+        lines.append("")
+        lines.append(_user_keys_pattern_line(count))
+    lines.append("")
+    lines.append("Key hatane ke liye: `/removekey 1` (index number daalo)")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def remove_key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/removekey N`  (1-based index)\n\nPehle `/listkeys` se index pata karo.",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        n = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("❌ Index number bhejo. Example: `/removekey 1`")
+        return
+    if n < 1:
+        await update.message.reply_text("❌ Index 1 se chhota nahi ho sakta.")
+        return
+    uid_str = str(update.effective_user.id)
+    keys_list = _user_keys_as_list(uid_str)
+    if n > len(keys_list):
+        await update.message.reply_text(
+            f"❌ Index {n} galat hai. Aapke paas sirf {len(keys_list)} key hai."
+        )
+        return
+    removed = keys_list.pop(n - 1)
+    removed_masked = (removed[:10] + "..." + removed[-4:]) if len(removed) > 14 else "key"
+    if len(keys_list) == 0:
+        _save_groq_keys_for_user(uid_str, [])
+        await update.message.reply_text(f"🗑️ Key {removed_masked} removed.\nAb koi key nahi bacha.")
+    elif len(keys_list) == 1:
+        _save_groq_keys_for_user(uid_str, keys_list[0])
+        msg = f"🗑️ Key {removed_masked} removed.\nRemaining: 1 key."
+        await update.message.reply_text(msg)
+    else:
+        _save_groq_keys_for_user(uid_str, keys_list)
+        msg = f"🗑️ Key {removed_masked} removed.\nRemaining keys: {len(keys_list)}\n" + _user_keys_pattern_line(len(keys_list))
+        await update.message.reply_text(msg)
+
+
+async def set_keys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/setkeys gsk_k1 gsk_k2 ...`  (purani keys replace ho jayengi)\nMax 5 keys.",
+            parse_mode="Markdown",
+        )
+        return
+    raw_keys = [k.strip() for k in context.args[:MAX_GROQ_KEYS_PER_USER]]
+    valid_keys = []
+    for k in raw_keys:
+        if not k.startswith("gsk_"):
+            await update.message.reply_text(f"❌ Invalid key `{k[:10]}...`. Must start with `gsk_`", parse_mode="Markdown")
+            return
+        valid_keys.append(k)
+    if not valid_keys:
+        await update.message.reply_text("❌ Koi valid key nahi mili.")
+        return
+    uid_str = str(update.effective_user.id)
+    store_val = valid_keys[0] if len(valid_keys) == 1 else valid_keys
+    _save_groq_keys_for_user(uid_str, store_val)
+    if len(valid_keys) == 1:
+        msg = "✅ 1 key set kar di gayi hai."
+    else:
+        msg = f"✅ {len(valid_keys)} keys set!\n" + _user_keys_pattern_line(len(valid_keys))
+    await update.message.reply_text(msg)
 
 
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2629,6 +4171,63 @@ async def account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Remove failed")
 
 
+async def useaccount_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot = get_bot(update.effective_user.id)
+    if not context.args:
+        accs = bot.list_accounts()
+        if not accs:
+            await update.message.reply_text(
+                "No saved accounts in `minipix_accounts.json`.\n"
+                "Usage: `/useaccount <label>`\n"
+                "Example: `/useaccount aa`\n"
+                "Ya phir `/accounts` se inline buttons use karo.",
+                parse_mode="Markdown",
+            )
+        else:
+            preview = "\n".join(f"  • {i+1}. `{lbl}`" for i, lbl in enumerate(accs))
+            await update.message.reply_text(
+                "Usage: `/useaccount <label>`\n\n"
+                f"Available labels:\n{preview}\n\n"
+                "Example: `/useaccount aa`",
+                parse_mode="Markdown",
+            )
+        return
+    label = " ".join(context.args).strip()
+    if not label:
+        await update.message.reply_text("Label missing. Usage: `/useaccount bb`", parse_mode="Markdown")
+        return
+    ok, msg = bot.switch_account(label)
+    if ok:
+        bot.open_app()
+        bal = bot.get_balance()
+        await update.message.reply_text(
+            f"✅ {msg}\n💰 Balance: {bal}",
+            reply_markup=main_menu_keyboard(),
+        )
+    else:
+        accs = bot.list_accounts()
+        hint = ""
+        if accs:
+            hint = "\nAvailable: " + ", ".join(f"`{a}`" for a in accs)
+        await update.message.reply_text(f"❌ {msg}{hint}", parse_mode="Markdown")
+
+
+async def reloadaccounts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot = get_bot(update.effective_user.id)
+    before = len(bot.accounts)
+    bot.accounts = bot._load_accounts()
+    after = len(bot.accounts)
+    accs = bot.list_accounts()
+    preview = ""
+    if accs:
+        preview = "\n" + "\n".join(f"  • `{lbl}` → {bot.accounts[lbl].get('phone','?')}" for lbl in accs)
+    await update.message.reply_text(
+        f"🔄 Accounts reloaded: {before} → {after}{preview}",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
 # ───────── Browse Series ─────────
 async def series_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -2655,12 +4254,11 @@ async def series_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📚 *Series List* — Page {cur_page}/{total_pages}  ({total} total)",
         "",
         "Button mein `[series_id]` dikh raha hai. Use karo:",
-        "`/watch <series_id>` → us series ke SARE episodes 4x watch",
+        "`/watch <series_id>` → us series ke SARE episodes 1x watch",
         "",
         "Icons:",
         "`▶` Not watched",
-        "`1/4–3/4` Watched N times",
-        "`✔` 4x complete (max reward)",
+        "`✔` 1x complete (max reward)",
         "",
         "Ya kisi series par tap karo → episode menu dikhega.",
     ]
@@ -2738,9 +4336,9 @@ async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎞️ *{title}*\n"
             f"Total episodes: {total_eps}\n"
             f"Progress: {done}/{total_eps} started | "
-            f"{maxed}/{total_eps} 4x-complete\n\n"
+            f"{maxed}/{total_eps} 1x-complete\n\n"
             "• Tap `E1`, `E2`... → 1 episode watch\n"
-            "• Tap *🔥 Watch ALL (4x) This Series* → full series smart-repeat"
+            "• Tap *🔥 Watch All Episodes This Series* → full series 1x watch"
         )
         await query.edit_message_text(
             text, parse_mode="Markdown", reply_markup=kb
@@ -2792,14 +4390,13 @@ async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 ok = result.get("ok") if isinstance(result, dict) else False
                 status = result.get("status") if isinstance(result, dict) else "?"
-                nth = result.get("nth_watch") if isinstance(result, dict) else "?"
                 reward = result.get("reward_expected") if isinstance(result, dict) else "?"
                 delta = result.get("delta") if isinstance(result, dict) else None
                 bal_after = result.get("balance_after") if isinstance(result, dict) else None
                 t = (
                     f"🏁 Episode done: S{sid} E{ep_no}\n"
                     f"Result: {'✅' if ok else '❌'} status={status}\n"
-                    f"Watch #{nth} (expected +{reward})\n"
+                    f"Watch 1x (expected +{reward})\n"
                 )
                 if delta is not None:
                     t += f"💰 Delta: {delta:+d}  |  Balance now: {bal_after}"
@@ -2824,7 +4421,7 @@ async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("Not logged in.")
                 return
             msg = await query.message.reply_text(
-                f"🔥 Starting SMART 4x repeat for series {sid}..."
+                f"🔥 Starting 1x Watch All for series {sid}..."
             )
             loop = asyncio.get_running_loop()
 
@@ -2833,7 +4430,7 @@ async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     loop.call_soon_threadsafe(
                         lambda: asyncio.create_task(
                             msg.edit_text(
-                                f"🔥 Series 4x Watch S{sid}…\n\n{str(text)[-1400:]}"
+                                f"🔥 Series Watch S{sid}…\n\n{str(text)[-1400:]}"
                             )
                         )
                     )
@@ -2856,7 +4453,7 @@ async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             skip = result.get("skipped", 0) if isinstance(result, dict) else 0
             fail = result.get("failed", 0) if isinstance(result, dict) else 0
             t = (
-                f"🏁 Series 4x done: {result.get('series_title', sid)}\n\n"
+                f"🏁 Series done: {result.get('series_title', sid)}\n\n"
                 f"Watched: {watched}\nSkip: {skip}\nFail: {fail}\n"
             )
             if isinstance(result, dict) and result.get("delta") is not None:
@@ -3070,14 +4667,14 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if series_id_arg:
             msg = await update.message.reply_text(
-                f"🔥 Starting SMART 4x repeat for Series `{series_id_arg}`...\n"
+                f"🔥 Starting 1x Watch All for Series `{series_id_arg}`...\n"
                 "(series detail + episodes load ho rahe hain)",
                 parse_mode="Markdown",
             )
             mode_label = f"Series {series_id_arg}"
         else:
             msg = await update.message.reply_text(
-                "🚀 Starting Smart 4x Watch (Option 11 mode)...\nThoda time lagega."
+                "🚀 Starting Watch ALL (Option 11 mode, 1x each ep)...\nThoda time lagega."
             )
             mode_label = "Opt11 ALL"
 
@@ -3177,14 +4774,14 @@ async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    await update.message.reply_text("Kitne quiz sessions? (10-25, default 15):")
+    await update.message.reply_text("Kitne quiz sessions? (1-20, default 15):")
     return WAIT_QUIZ_SESSIONS
 
 
 async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         n = int(update.message.text.strip() or "15")
-        n = max(10, min(25, n))
+        n = max(1, min(20, n))
     except Exception:
         n = 15
     context.user_data["quiz_sessions"] = n
@@ -3269,7 +4866,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await login_start(update, context)
     elif text == "🎬 Browse Series":
         await series_cmd(update, context)
-    elif text == "🎬 Watch All (4x)":
+    elif text == "🎬 Watch All Series" or text == "🎬 Watch All (4x)" or text == "🎬 Watch All (Fast)":
         await watch_cmd(update, context)
     elif text == "🧠 Quiz Status":
         await quiz_status_cmd(update, context)
@@ -3349,6 +4946,8 @@ def main():
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("campaign", campaign_cmd))
     app.add_handler(CommandHandler("accounts", accounts_cmd))
+    app.add_handler(CommandHandler("useaccount", useaccount_cmd))
+    app.add_handler(CommandHandler("reloadaccounts", reloadaccounts_cmd))
     app.add_handler(CommandHandler("login", login_start))
     app.add_handler(CommandHandler("tokenlogin", tokenlogin_cmd))
     app.add_handler(CommandHandler("series", series_cmd))
@@ -3356,6 +4955,10 @@ def main():
     app.add_handler(CommandHandler("quiz", quiz_status_cmd))
     app.add_handler(CommandHandler("setgroq", set_groq))
     app.add_handler(CommandHandler("mygroq", my_groq))
+    app.add_handler(CommandHandler("addkey", add_key_cmd))
+    app.add_handler(CommandHandler("listkeys", list_keys_cmd))
+    app.add_handler(CommandHandler("removekey", remove_key_cmd))
+    app.add_handler(CommandHandler("setkeys", set_keys_cmd))
     app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CallbackQueryHandler(account_callback, pattern=r"^(sw|rm):"))
     app.add_handler(
