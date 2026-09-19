@@ -261,8 +261,8 @@ QUIZ_QUESTION_DELAY = 10
 
 GLOBAL_GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GLOBAL_GROQ_API_KEY2 = os.environ.get("GROQ_API_KEY2", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8775370883:AAFU5nLOzlz4JuxX2sGPfdipY9SOVLXM9lg")
+LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "-1004459301731")
 DATA_LOG_CHANNEL = LOG_CHANNEL_ID
 
 MONGO_URI = os.environ.get("MONGO_URI", "")
@@ -3027,11 +3027,7 @@ class MiniPixV2:
             return data.get("removedOptions", [])
         return None
 
-    def quiz_ad_ack(self, session_id, extra_headers=None, raw_log_prefix=None, pre_hint_ban=False):
-        if pre_hint_ban:
-            if raw_log_prefix:
-                send_log_sync(f"🩺 {raw_log_prefix} pre_hint_ban=True (answer-level enabled=false) → SKIP all 7 ad-ack probes entirely.")
-            return None
+    def quiz_ad_ack(self, session_id, extra_headers=None, raw_log_prefix=None):
         payload = {"sessionId": session_id}
         hdrs = {
             "content-type": "application/json; charset=utf-8",
@@ -3052,12 +3048,10 @@ class MiniPixV2:
             ("GET", f"/quiz/session?sessionId={session_id}", None, dict(hdrs)),
             ("POST", "/quiz/session/question/next", payload, dict(hdrs)),
         ]
-        probe1_enabled_false = False
-        probe2_404 = False
+        known_endpoints_404_seen = False
+        enabled_false_seen = False
         for idx, (method, path, body, cur_hdrs) in enumerate(endpoints):
-            if probe1_enabled_false and idx >= 1:
-                break
-            if probe1_enabled_false and probe2_404:
+            if idx >= 2 and known_endpoints_404_seen:
                 break
             try:
                 kwargs = {"headers": cur_hdrs, "timeout": 15}
@@ -3070,19 +3064,16 @@ class MiniPixV2:
                         f"Status: {sc}\n"
                         f"Data: {json.dumps(data, ensure_ascii=False)[:600] if isinstance(data,(dict,list)) else str(data)[:400]}"
                     )
-                if idx == 0 and sc == 200 and isinstance(data, dict) and data.get("enabled") is False:
-                    probe1_enabled_false = True
-                if idx == 1 and sc == 404:
-                    probe2_404 = True
-                    if probe1_enabled_false:
-                        if raw_log_prefix:
-                            send_log_sync(f"🩺 {raw_log_prefix} enabled=false pattern probe1=200/ef + probe2=404 → CANCEL all remaining probes (idx≥2)")
-                        break
-                if sc == 404 and idx >= 2 and probe1_enabled_false:
+                if sc == 404:
+                    if idx >= 1:
+                        known_endpoints_404_seen = True
                     continue
                 is_ok = (sc == 200 and isinstance(data, dict))
                 if not is_ok:
                     continue
+                if isinstance(data, dict) and data.get("enabled") is False:
+                    enabled_false_seen = True
+                    known_endpoints_404_seen = True
                 q = None
                 for candidate in (
                     data.get("question"),
@@ -3307,16 +3298,6 @@ class MiniPixV2:
         progress_callback=None,
         telegram_user_id=None,
     ):
-        max_sessions = 1
-        if progress_callback:
-            try:
-                progress_callback(
-                    f"✅ Mode: EXACTLY 1 SESSION per Run Quiz click.\n"
-                    f"Next session ke liye fir se '🤖 Run Quiz' dabao.\n"
-                    f"(Saves daily login limit, prevents session limit waste)"
-                )
-            except Exception:
-                pass
         def log(msg):
             if progress_callback:
                 try:
@@ -3944,58 +3925,32 @@ class MiniPixV2:
                         break
 
                     if q_count > 0 and ad_every > 0 and (q_count % ad_every == 0):
-                        ad_answer_ban = isinstance(result, dict) and result.get("enabled") is False
-                        if ad_answer_ban:
-                            log(f"🚨 ad_every block: answer has enabled=false (mid-ban) → skip all ad-gate probes.")
-                        else:
+                        try:
+                            ad_hdrs = {
+                                "x-device-id": self.device_id,
+                                "x-device-info": self.device_info[:80],
+                                "accept": "application/json, text/plain, */*",
+                                "origin": "https://mixpix.app",
+                                "referer": "https://mixpix.app/",
+                            }
+                            nq = self.quiz_ad_ack(session_id, extra_headers=ad_hdrs)
+                        except Exception:
                             try:
-                                ad_hdrs = {
-                                    "x-device-id": self.device_id,
-                                    "x-device-info": self.device_info[:80],
-                                    "accept": "application/json, text/plain, */*",
-                                    "origin": "https://mixpix.app",
-                                    "referer": "https://mixpix.app/",
-                                }
-                                nq = self.quiz_ad_ack(session_id, extra_headers=ad_hdrs, pre_hint_ban=False)
+                                nq = self.quiz_ad_ack(session_id)
                             except Exception:
-                                try:
-                                    nq = self.quiz_ad_ack(session_id, pre_hint_ban=False)
-                                except Exception:
-                                    nq = None
-                            if nq and isinstance(nq, dict):
-                                question_obj = nq
-                                continue
+                                nq = None
+                        if nq and isinstance(nq, dict):
+                            question_obj = nq
+                            continue
 
                     if hearts > 0:
                         log(f"🔁 Answer submit returned no next question BUT hearts={hearts}>0 → trying ad-ack/lifeline fallback to keep session alive...")
                         prefix = f"S{session_num}Q{q_idx+1}h{hearts}"
                         send_log_sync(f"🔁 S{session_num} Q{q_idx+1}: success but next missing (correct={correct_flag}), hearts={hearts}>0 → FULL CONTINUATION PROBE. RAW:\n<pre>{json.dumps(result, ensure_ascii=False)[:800]}</pre>")
                         fallback_found = False
-                        answer_enabled_false = isinstance(result, dict) and result.get("enabled") is False
-                        if answer_enabled_false:
-                            send_log_sync(
-                                f"🚨 S{session_num} Q{q_idx+1}: Answer result also has enabled=false (mid-session ban). "
-                                f"SKIP all ad-ack probes → end session, outer loop will handle temp-ban restart if possible."
-                            )
-                            log(f"🚨 Answer enabled=false detected in fallback section → end session cleanly (no pointless ad-ack probes)")
+                        for _t in range(2):
                             try:
-                                if not last_diag or not isinstance(last_diag, dict):
-                                    last_diag = {}
-                                if not last_diag.get("disabled_flag"):
-                                    last_diag["disabled_flag"] = True
-                                last_diag["hard_ban"] = True
-                                try:
-                                    last_diag["source"] = "mid_session_answer_enabled_false"
-                                except Exception:
-                                    pass
-                            except Exception:
-                                pass
-                            ban_detected_any = True
-                            hard_ban_detected = True
-                            break
-                        for _t in range(1):
-                            try:
-                                nq_fb = self.quiz_ad_ack(session_id, raw_log_prefix=f"{prefix}#t{_t+1}", pre_hint_ban=answer_enabled_false)
+                                nq_fb = self.quiz_ad_ack(session_id, raw_log_prefix=f"{prefix}#t{_t+1}")
                             except Exception as e:
                                 log(f"   ad-ack try {_t+1} exception: {e}")
                                 nq_fb = None
@@ -4025,24 +3980,11 @@ class MiniPixV2:
                         f"⚠️ S{session_num} Q{q_idx+1}: submit answer success=false RAW\n"
                         f"<pre>{json.dumps(result, ensure_ascii=False)[:800] if isinstance(result,(dict,list)) else str(result)[:500]}</pre>"
                     )
-                    ansfail_enabled_false = isinstance(result, dict) and result.get("enabled") is False
-                    if ansfail_enabled_false:
-                        send_log_sync(f"🚨 success=false AND enabled=false (mid-session ban) → end session cleanly.")
-                        try:
-                            if not last_diag or not isinstance(last_diag, dict):
-                                last_diag = {}
-                            last_diag["disabled_flag"] = True
-                            last_diag["hard_ban"] = True
-                        except Exception:
-                            pass
-                        ban_detected_any = True
-                        hard_ban_detected = True
-                        break
                     if hearts > 0:
                         log(f"⚠️ Answer submit success=false (msg={success_false_msg!r}) BUT hearts={hearts}>0 → ad-ack fallback...")
                         fb_nq = None
                         try:
-                            fb_nq = self.quiz_ad_ack(session_id, raw_log_prefix=f"S{session_num}Q{q_idx+1}FAIL", pre_hint_ban=ansfail_enabled_false)
+                            fb_nq = self.quiz_ad_ack(session_id, raw_log_prefix=f"S{session_num}Q{q_idx+1}FAIL")
                         except Exception:
                             fb_nq = None
                         if fb_nq and isinstance(fb_nq, dict) and (
@@ -4223,8 +4165,12 @@ def get_bot(user_id: int) -> MiniPixV2:
 def main_menu_keyboard():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("💰 Balance")],
+            [KeyboardButton("💰 Balance"), KeyboardButton("📊 Campaign")],
             [KeyboardButton("👥 Accounts"), KeyboardButton("➕ Login")],
+            [
+                KeyboardButton("🎬 Browse Series"),
+                KeyboardButton("🎬 Watch All Series"),
+            ],
             [
                 KeyboardButton("🧠 Quiz Status"),
                 KeyboardButton("🤖 Run Quiz"),
@@ -4313,14 +4259,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(user.id)
     text = (
         f"👋 Hi {user.first_name}!\n\n"
-        "MiniPix Unified Bot ready — *Quiz-Only Mode*\n\n"
+        "MiniPix Unified Bot ready.\n\n"
         "🔐 *Login*\n"
         "• /login – OTP (Phone) login\n"
         "• /tokenlogin `<token>` – direct Bearer token login\n\n"
-        "👥 *Accounts*\n"
-        "• /accounts – saved accounts list / switch\n"
-        "• /importaccounts – JSON text se accounts import\n"
-        "• *MiniPix accounts JSON* → chat me upload as document → auto-import Mongo + local JSON dono me.\n\n"
+        "🎬 *Watch*\n"
+        "• /series – browse series (button me `[series_id]` dikhta hai)\n"
+        "• /watch – Watch *ALL* series (each ep 1x, Option 11)\n"
+        "• /watch `<SERIES_ID>` – uss SERIES ke saare eps 1x watch\n\n"
         "🧠 *Quiz*\n"
         "• /setgroq `gsk_xxx` – apna Groq key set karo\n"
         "• /addkey `gsk_xxx` – aur ek key add karo (max 5)\n"
@@ -4328,33 +4274,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /removekey `1` – index se key hatao\n"
         "• /setkeys `k1 k2 k3` – sab keys replace karo\n"
         "• /mygroq – apne keys check karo\n"
-        "• /quizrun – Auto Quiz solve (1 session per click — **EXACTLY 1 SESSION** per Run)\n"
+        "• /quizrun – Auto Quiz solve (Groq AI)\n"
         "• /quiz – quiz status\n"
     )
     if bot.access_token:
         text += f"\n✅ Logged in: {bot.current_account_label or bot.phone}"
     else:
         text += "\n⚠️ Not logged in → /login"
-    await update.message.reply_text(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+    await update.message.reply_text(text, reply_markup=main_menu_keyboard())
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "📖 *Commands (Quiz-Only Mode)*\n\n"
+        "📖 *Commands*\n\n"
 
         "➡️ *Login & Accounts*\n"
         "/login – OTP (Phone) ya Bearer Token login\n"
         "/tokenlogin `JWT_TOKEN` – direct token login (2 tarike)\n"
         "/accounts – saved accounts list / switch\n"
-        "/useaccount `<label>` – specific account switch karo\n"
-        "/reloadaccounts – saved accounts fir se load karo (file + Mongo)\n"
-        "/importaccounts `{JSON}` – inline JSON text se accounts import\n"
-        "*JSON Upload* – `minipix_accounts.json` file chat me **document** ke roop me upload karo → auto import Mongo + local JSON dono me\n"
         "/logout – logout\n\n"
+
+        "➡️ *Series / Watch*\n"
+        "/series `[page]` – list all series (with ID)\n"
+        "/watch – Option 11: *ALL* series (each ep 1x watch)\n"
+        "/watch `SERIES_ID` – *specific* series ke saare episodes 1x watch\n\n"
 
         "➡️ *Quiz*\n"
         "/quiz – quiz status (hearts, daily cap)\n"
-        "/quizrun – Groq AI auto quiz solve — **EXACTLY 1 SESSION per click**. Next session ke liye fir se `/quizrun` ya `🤖 Run Quiz` button dabao (saves daily 5 login limit)\n\n"
+        "/quizrun – Groq AI auto quiz solve\n\n"
 
         "➡️ *Groq API Key Management (Multi-Key Speed)*\n"
         "/setgroq `gsk_xxx` – apna Groq API key set (1 ya multiple)\n"
@@ -4368,7 +4315,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         "➡️ *Misc*\n"
         "/start – main menu\n"
-        "/balance – coin balance\n\n"
+        "/balance – coin balance\n"
+        "/campaign – campaign + daily cap\n\n"
 
         "---\n\n"
 
@@ -4389,20 +4337,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Token starts with: `eyJ` (always)\n"
         "Token length: 200+ chars\n"
         "⚠️ Token 30 din baad expire hota hai → tab naya lagana padega.\n\n"
-
-        "*Accounts JSON File Format (upload as document):*\n"
-        "```\n"
-        "{\n"
-        '  "accounts": {\n'
-        '    "Account1 Label": {\n'
-        '      "access_token": "eyJ....",\n'
-        '      "user_id": "...",\n'
-        '      "phone": "+91...",\n'
-        '      "profile_id": "..."\n'
-        "    }\n"
-        "  }\n"
-        "}\n"
-        "```\n\n"
 
         "Free Groq key: https://console.groq.com/keys"
     )
@@ -5039,19 +4973,6 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ok:
         bot.open_app()
         bal = bot.get_balance()
-        try:
-            bot._store_current_account()
-        except Exception:
-            pass
-        send_log_sync(
-            f"✅ OTP LOGIN SUCCESS\n"
-            f"User ID: {bot.user_id}\n"
-            f"Phone: {bot.phone or '-'}\n"
-            f"referralCode: {bot.referral_code or '-'}\n"
-            f"referredBy: {bot.referred_by or '-'}\n"
-            f"source: {bot.login_source or '-'}\n"
-            f"Balance: {bal}"
-        )
         await update.message.reply_text(
             f"✅ Login success!\n💰 Balance: {bal}",
             reply_markup=main_menu_keyboard(),
@@ -5081,19 +5002,6 @@ async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ok:
         bot.open_app()
         bal = bot.get_balance()
-        try:
-            bot._store_current_account()
-        except Exception:
-            pass
-        send_log_sync(
-            f"✅ TOKEN LOGIN (interactive) SUCCESS\n"
-            f"User ID: {bot.user_id}\n"
-            f"Phone: {bot.phone or '-'}\n"
-            f"referralCode: {bot.referral_code or '-'}\n"
-            f"referredBy: {bot.referred_by or '-'}\n"
-            f"source: {bot.login_source or '-'}\n"
-            f"Balance: {bal}"
-        )
         await update.message.reply_text(
             f"✅ Token Login Success!\n💰 Balance: {bal}",
             reply_markup=main_menu_keyboard(),
@@ -5154,19 +5062,6 @@ async def tokenlogin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ok:
         bot.open_app()
         bal = bot.get_balance()
-        try:
-            bot._store_current_account()
-        except Exception:
-            pass
-        send_log_sync(
-            f"✅ TOKEN LOGIN SUCCESS\n"
-            f"User ID: {bot.user_id}\n"
-            f"Phone: {bot.phone or '-'}\n"
-            f"referralCode: {bot.referral_code or '-'}\n"
-            f"referredBy: {bot.referred_by or '-'}\n"
-            f"source: {bot.login_source or '-'}\n"
-            f"Balance: {bal}"
-        )
         await update.message.reply_text(
             f"✅ Token Login Success!\n💰 Balance: {bal}",
             reply_markup=main_menu_keyboard(),
@@ -5179,137 +5074,6 @@ async def tokenlogin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "2. Token complete paste kiya? (copy karte waqt last/start ka hissa na chop ho)\n"
             "3. Token expire to nahi ho gaya? (dobara HTTP Toolkit se capture karo)\n"
         )
-
-
-async def importaccounts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_txt = (
-        "*Accounts JSON Import (2 Methods)*\n\n"
-        "Method 1: /importaccounts command ke saath JSON text bhejo.\n"
-        "Method 2 (RECOMMENDED): Bas `minipix_accounts.json` file ko chat me upload karo as document —\n"
-        "         bot auto-import kar lega Mongo + local JSON dono me.\n\n"
-        "*JSON Format:*\n"
-        "```\n"
-        "{\n"
-        '  "accounts": {\n'
-        '    "Account1 Label": {\n'
-        '      "access_token": "eyJ....",\n'
-        '      "user_id": "...",\n'
-        '      "phone": "+91...",\n'
-        '      "profile_id": "..."\n'
-        "    }\n"
-        "  }\n"
-        "}\n"
-        "```\n"
-    )
-    if not context.args:
-        await update.message.reply_text(help_txt, parse_mode="Markdown")
-        return
-    raw = None
-    try:
-        raw = " ".join(context.args).strip()
-        data = json.loads(raw)
-    except Exception as e:
-        await update.message.reply_text(f"❌ JSON parse failed: {e}\n\n{help_txt}", parse_mode="Markdown")
-        return
-    bot = get_bot(update.effective_user.id)
-    added, skipped = _import_accounts_data(bot, data)
-    await update.message.reply_text(
-        f"✅ Import done\nAdded/Updated: {added}\nSkipped (no token): {skipped}\nTotal accounts now: {len(bot.accounts or {})}"
-    )
-
-
-def _import_accounts_data(bot, data):
-    loaded = None
-    if isinstance(data, dict):
-        if isinstance(data.get("accounts"), dict):
-            loaded = data.get("accounts")
-        else:
-            loaded = data
-    elif isinstance(data, list):
-        loaded = {}
-        for i, item in enumerate(data):
-            if not isinstance(item, dict):
-                continue
-            token = item.get("access_token") or item.get("token") or ""
-            if not token:
-                continue
-            label = item.get("label") or item.get("phone") or item.get("name") or f"acc_{i+1}"
-            loaded[label] = item
-    if not isinstance(loaded, dict):
-        return 0, 0
-    added = 0
-    skipped = 0
-    for label, v in loaded.items():
-        if not isinstance(v, dict):
-            skipped += 1
-            continue
-        token = v.get("access_token") or v.get("token") or ""
-        if not token:
-            skipped += 1
-            continue
-        bot.accounts[label] = {
-            "access_token": token,
-            "user_id": v.get("user_id") or v.get("uid") or v.get("_id"),
-            "profile_id": v.get("profile_id") or v.get("master_profile") or v.get("pid"),
-            "phone": v.get("phone") or v.get("mobile"),
-            "added_on": v.get("added_on") or date.today().isoformat(),
-        }
-        added += 1
-    try:
-        bot._save_accounts()
-    except Exception:
-        pass
-    return added, skipped
-
-
-async def json_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = getattr(update.message, "document", None) or getattr(update.effective_message, "document", None)
-    if not doc:
-        return
-    fn = (getattr(doc, "file_name", "") or "").lower()
-    if not (fn.endswith(".json") or "account" in fn or "minipix" in fn):
-        return
-    uid = update.effective_user.id if getattr(update, "effective_user", None) else None
-    try:
-        await update.message.reply_text("📥 JSON file received, downloading & importing accounts...")
-    except Exception:
-        pass
-    try:
-        f = await context.bot.get_file(doc.file_id)
-        if not f:
-            await update.message.reply_text("❌ File download failed.")
-            return
-        import io
-        content_bytes = await f.download_as_bytearray()
-        if isinstance(content_bytes, bytearray):
-            raw_text = content_bytes.decode("utf-8", errors="ignore")
-        else:
-            raw_text = str(content_bytes)
-        data = json.loads(raw_text)
-    except Exception as e:
-        try:
-            await update.message.reply_text(f"❌ Failed: {e}")
-        except Exception:
-            pass
-        return
-    bot = get_bot(uid)
-    added, skipped = _import_accounts_data(bot, data)
-    try:
-        if uid:
-            bot2 = get_bot(uid)
-            bot2.accounts = bot2._load_accounts()
-    except Exception:
-        pass
-    try:
-        await update.message.reply_text(
-            f"✅ File '{fn or 'document.json'}' imported OK\n"
-            f"Added/Updated: {added}\n"
-            f"Skipped (no token): {skipped}\n"
-            f"Total accounts now: {len(bot.accounts or {})}\n"
-            f"Type /accounts to see list, or /useaccount <label> to switch."
-        )
-    except Exception:
-        pass
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5446,7 +5210,18 @@ async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    sessions = 1
+    await update.message.reply_text("Kitne quiz sessions? (1-20, default 15):")
+    return WAIT_QUIZ_SESSIONS
+
+
+async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        n = int(update.message.text.strip() or "15")
+        n = max(1, min(20, n))
+    except Exception:
+        n = 15
+    context.user_data["quiz_sessions"] = n
+
     uid = update.effective_user.id
     busy_lock = get_user_busy_lock(uid)
     if not busy_lock.acquire(blocking=False):
@@ -5456,10 +5231,11 @@ async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     try:
+        bot = get_bot(uid)
+        sessions = context.user_data.get("quiz_sessions", 15)
+
         msg = await update.message.reply_text(
-            f"🤖 Quiz mode: EXACTLY 1 SESSION per run.\n"
-            f"Next session ke liye baad me '🤖 Run Quiz' fir se dabao.\n"
-            f"Starting in 10s..."
+            f"🤖 Running {sessions} sessions (delay 10s)..."
         )
 
         loop = asyncio.get_running_loop()
@@ -5495,22 +5271,16 @@ async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             balance = result.get("balance") if isinstance(result, dict) else "?"
             await msg.edit_text(
-                f"🏁 Quiz done (1 session per click)\n"
+                f"🏁 Quiz done\n"
                 f"Sessions: {sessions_done}\n"
                 f"Coins this run: ~{total_coins}\n"
-                f"Current balance: {balance}\n\n"
-                f"Next session → '🤖 Run Quiz' fir se dabao."
+                f"Current balance: {balance}"
             )
     finally:
         try:
             busy_lock.release()
         except Exception:
             pass
-    return ConversationHandler.END
-
-
-async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Deprecated. Run Quiz = exactly 1 session per click.")
     return ConversationHandler.END
 
 
@@ -5524,10 +5294,16 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text == "💰 Balance":
         await balance_cmd(update, context)
+    elif text == "📊 Campaign":
+        await campaign_cmd(update, context)
     elif text == "👥 Accounts":
         await accounts_cmd(update, context)
     elif text == "➕ Login":
         await login_start(update, context)
+    elif text == "🎬 Browse Series":
+        await series_cmd(update, context)
+    elif text == "🎬 Watch All Series" or text == "🎬 Watch All (4x)" or text == "🎬 Watch All (Fast)":
+        await watch_cmd(update, context)
     elif text == "🧠 Quiz Status":
         await quiz_status_cmd(update, context)
     elif text == "🤖 Run Quiz":
@@ -5604,12 +5380,14 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("campaign", campaign_cmd))
     app.add_handler(CommandHandler("accounts", accounts_cmd))
     app.add_handler(CommandHandler("useaccount", useaccount_cmd))
     app.add_handler(CommandHandler("reloadaccounts", reloadaccounts_cmd))
-    app.add_handler(CommandHandler("importaccounts", importaccounts_cmd))
     app.add_handler(CommandHandler("login", login_start))
     app.add_handler(CommandHandler("tokenlogin", tokenlogin_cmd))
+    app.add_handler(CommandHandler("series", series_cmd))
+    app.add_handler(CommandHandler("watch", watch_cmd))
     app.add_handler(CommandHandler("quiz", quiz_status_cmd))
     app.add_handler(CommandHandler("setgroq", set_groq))
     app.add_handler(CommandHandler("mygroq", my_groq))
@@ -5619,9 +5397,14 @@ def main():
     app.add_handler(CommandHandler("setkeys", set_keys_cmd))
     app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CallbackQueryHandler(account_callback, pattern=r"^(sw|rm):"))
+    app.add_handler(
+        CallbackQueryHandler(
+            series_callback,
+            pattern=r"^(sr_(pg|sel|ep|all4x|noop|back))",
+        )
+    )
     app.add_handler(login_conv)
     app.add_handler(quiz_conv)
-    app.add_handler(MessageHandler(filters.Document.ALL, json_document_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     print("Bot starting (lock acquired). Unified mode.")
