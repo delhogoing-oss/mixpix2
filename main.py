@@ -751,18 +751,91 @@ def _ensure_groq_loaded():
 user_groq_keys: dict = load_user_groq_keys()
 
 
+_BAD_GROQ_KEYS = set()
+_BAD_GROQ_KEYS_LOCK = threading.Lock()
+
+
+def _mark_groq_key_invalid_and_remove(api_key, telegram_user_id=None):
+    if not api_key:
+        return False
+    removed = False
+    with _BAD_GROQ_KEYS_LOCK:
+        if api_key not in _BAD_GROQ_KEYS:
+            _BAD_GROQ_KEYS.add(api_key)
+            removed = True
+    try:
+        try:
+            _GROQ_LIST[:] = [k for k in _GROQ_LIST if k != api_key]
+        except Exception:
+            pass
+    except Exception:
+        pass
+    if telegram_user_id is not None:
+        try:
+            uid_str = str(telegram_user_id)
+            current = user_groq_keys.get(uid_str)
+            changed = False
+            if isinstance(current, list):
+                new_list = [k for k in current if k != api_key]
+                if len(new_list) != len(current):
+                    user_groq_keys[uid_str] = new_list
+                    changed = True
+            elif isinstance(current, str) and current == api_key:
+                user_groq_keys[uid_str] = []
+                changed = True
+            if changed:
+                try:
+                    save_user_groq_keys(user_groq_keys)
+                except Exception:
+                    pass
+                try:
+                    col = _mongo_keys_col()
+                    if col is not None:
+                        remaining = user_groq_keys.get(uid_str)
+                        if isinstance(remaining, list):
+                            keys_list = [k for k in remaining if isinstance(k, str) and k]
+                        elif isinstance(remaining, str) and remaining:
+                            keys_list = [remaining]
+                        else:
+                            keys_list = []
+                        if keys_list:
+                            col.replace_one(
+                                {"telegram_user_id": uid_str},
+                                {"telegram_user_id": uid_str, "keys": keys_list, "updated_at": datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()},
+                                upsert=True,
+                            )
+                        else:
+                            col.delete_one({"telegram_user_id": uid_str})
+                except Exception:
+                    pass
+                try:
+                    send_log_sync(f"⚠️ Groq key invalid (401/403) → REMOVED for user <code>{telegram_user_id}</code>\nKeys remaining: {get_user_groq_key_count(telegram_user_id)}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return removed
+
+
+def _is_groq_key_bad(api_key) -> bool:
+    if not api_key:
+        return True
+    with _BAD_GROQ_KEYS_LOCK:
+        return api_key in _BAD_GROQ_KEYS
+
+
 def get_user_groq_key(user_id: int, key_index: int = 0) -> Optional[str]:
     keys = user_groq_keys.get(str(user_id))
     if isinstance(keys, list):
-        keys_list = [k for k in keys if k]
+        keys_list = [k for k in keys if k and not _is_groq_key_bad(k)]
         if keys_list:
             safe_idx = (key_index % len(keys_list)) if keys_list else 0
             if 0 <= safe_idx < len(keys_list):
                 return keys_list[safe_idx]
             return keys_list[0]
-    elif isinstance(keys, str) and keys:
+    elif isinstance(keys, str) and keys and not _is_groq_key_bad(keys):
         return keys
-    global_keys = [k for k in GLOBAL_GROQ_KEYS if k]
+    global_keys = [k for k in GLOBAL_GROQ_KEYS if k and not _is_groq_key_bad(k)]
     if global_keys:
         safe_idx = (key_index % len(global_keys)) if global_keys else 0
         if 0 <= safe_idx < len(global_keys):
@@ -880,26 +953,65 @@ class MiniPixV2:
         try:
             col = _mongo_accounts_col()
             if col is not None:
-                query = {}
                 if owner_id is not None:
-                    query = {"$or": [{"telegram_owner_id": owner_id}, {"telegram_owner_id": {"$exists": False}}]}
-                for doc in col.find(query, max_time_ms=MONGO_CONNECT_TIMEOUT_MS):
-                    lbl = doc.get("label")
-                    if not lbl:
-                        continue
-                    doc_owner = doc.get("telegram_owner_id")
-                    if owner_id is not None and doc_owner is not None and doc_owner != owner_id:
-                        continue
-                    entry = {
-                        "access_token": doc.get("access_token", ""),
-                        "user_id": doc.get("user_id"),
-                        "profile_id": doc.get("profile_id"),
-                        "phone": doc.get("phone"),
-                        "added_on": doc.get("added_on") or date.today().isoformat(),
-                        "telegram_owner_id": doc_owner,
-                    }
-                    if entry["access_token"]:
-                        base[lbl] = entry
+                    query = {"telegram_owner_id": owner_id}
+                    try:
+                        for doc in col.find(query, max_time_ms=MONGO_CONNECT_TIMEOUT_MS):
+                            lbl = doc.get("label")
+                            if not lbl:
+                                continue
+                            doc_owner = doc.get("telegram_owner_id")
+                            if doc_owner is not None and doc_owner != owner_id:
+                                continue
+                            entry = {
+                                "access_token": doc.get("access_token", ""),
+                                "user_id": doc.get("user_id"),
+                                "profile_id": doc.get("profile_id"),
+                                "phone": doc.get("phone"),
+                                "added_on": doc.get("added_on") or date.today().isoformat(),
+                                "telegram_owner_id": doc_owner,
+                            }
+                            if entry["access_token"]:
+                                base[lbl] = entry
+                    except Exception:
+                        pass
+                    try:
+                        legacy_query = {"telegram_owner_id": {"$exists": False}}
+                        for doc in col.find(legacy_query, max_time_ms=MONGO_CONNECT_TIMEOUT_MS):
+                            lbl = doc.get("label")
+                            if not lbl:
+                                continue
+                            if lbl in base:
+                                continue
+                            entry = {
+                                "access_token": doc.get("access_token", ""),
+                                "user_id": doc.get("user_id"),
+                                "profile_id": doc.get("profile_id"),
+                                "phone": doc.get("phone"),
+                                "added_on": doc.get("added_on") or date.today().isoformat(),
+                                "telegram_owner_id": None,
+                            }
+                            if entry["access_token"]:
+                                base[lbl] = entry
+                    except Exception:
+                        pass
+                else:
+                    query = {}
+                    for doc in col.find(query, max_time_ms=MONGO_CONNECT_TIMEOUT_MS):
+                        lbl = doc.get("label")
+                        if not lbl:
+                            continue
+                        doc_owner = doc.get("telegram_owner_id")
+                        entry = {
+                            "access_token": doc.get("access_token", ""),
+                            "user_id": doc.get("user_id"),
+                            "profile_id": doc.get("profile_id"),
+                            "phone": doc.get("phone"),
+                            "added_on": doc.get("added_on") or date.today().isoformat(),
+                            "telegram_owner_id": doc_owner,
+                        }
+                        if entry["access_token"]:
+                            base[lbl] = entry
         except Exception:
             pass
         return base
@@ -937,13 +1049,31 @@ class MiniPixV2:
                     if not doc["access_token"]:
                         continue
                     try:
-                        filt = {"label": label}
                         if owner_id is not None:
-                            filt = {"$or": [{"label": label, "telegram_owner_id": owner_id}, {"label": label, "telegram_owner_id": {"$exists": False}}]}
-                        col.replace_one(filt, doc, upsert=True)
+                            filt = {"label": label, "telegram_owner_id": owner_id}
+                        else:
+                            filt = {"label": label, "telegram_owner_id": {"$exists": False}}
+                        res = col.replace_one(filt, doc, upsert=True)
+                        matched = getattr(res, "matched_count", 0) or 0
+                        upserted = getattr(res, "upserted_id", None)
+                        if matched == 0 and upserted is None and owner_id is not None:
+                            try:
+                                uid_in_doc = acc.get("user_id")
+                                legacy_filt = {
+                                    "label": label,
+                                    "telegram_owner_id": {"$exists": False},
+                                }
+                                if uid_in_doc:
+                                    legacy_filt["user_id"] = uid_in_doc
+                                col.replace_one(legacy_filt, doc, upsert=True)
+                            except Exception:
+                                pass
                     except Exception:
                         try:
-                            col.replace_one({"label": label, "telegram_owner_id": owner_id}, doc, upsert=True)
+                            if owner_id is not None:
+                                col.replace_one({"label": label, "telegram_owner_id": owner_id}, doc, upsert=True)
+                            else:
+                                col.replace_one({"label": label, "telegram_owner_id": {"$exists": False}}, doc, upsert=True)
                         except Exception:
                             continue
         except Exception:
@@ -953,14 +1083,31 @@ class MiniPixV2:
     def _store_current_account(self, label=None):
         if not (self.access_token and self.user_id):
             return False
-        lbl = (
+        base_lbl = (
             label
             or self.phone
             or self.current_account_label
             or f"acc_{str(self.user_id)[-6:]}"
         )
-        self.current_account_label = lbl
-        self.accounts[lbl] = {
+        final_lbl = base_lbl
+        if label is None:
+            suffix_idx = 2
+            while True:
+                existing = self.accounts.get(final_lbl)
+                if existing is None:
+                    break
+                existing_uid = existing.get("user_id") if isinstance(existing, dict) else None
+                current_uid = self.user_id
+                if str(existing_uid) == str(current_uid):
+                    same_token = (existing.get("access_token") or "") == (self.access_token or "")
+                    if same_token or existing_uid is None:
+                        break
+                final_lbl = f"{base_lbl}_{suffix_idx}"
+                suffix_idx += 1
+                if suffix_idx > 1000:
+                    break
+        self.current_account_label = final_lbl
+        self.accounts[final_lbl] = {
             "access_token": self.access_token,
             "user_id": self.user_id,
             "profile_id": self.profile_id,
@@ -3284,6 +3431,25 @@ class MiniPixV2:
                         return idx, tag, answer_text
                 except Exception as e:
                     err = str(e).lower()
+                    is_auth_err = False
+                    try:
+                        for _kw in ("401", "403", "authentication", "unauthorized", "invalid api key", "api key invalid", "api key not found", "incorrect api key"):
+                            if re.search(_kw, err):
+                                is_auth_err = True
+                                break
+                        if not is_auth_err:
+                            try:
+                                import groq
+                                if isinstance(e, groq.AuthenticationError):
+                                    is_auth_err = True
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    if is_auth_err:
+                        send_log_sync(f"🔑 Groq SDK AUTH ERROR (401/403) on key for user {telegram_user_id} → auto-remove.")
+                        _mark_groq_key_invalid_and_remove(api_key, telegram_user_id)
+                        break
                     if "rate" in err or "limit" in err or "quota" in err or "429" in err:
                         send_log_sync(f"⏳ Model {model} rate‑limited, trying next.")
                         break
@@ -3313,6 +3479,10 @@ class MiniPixV2:
                     },
                     timeout=15,
                 )
+                if r.status_code in (401, 403):
+                    send_log_sync(f"🔑 Groq HTTP AUTH ERROR ({r.status_code}) on key for user {telegram_user_id} → auto-remove.")
+                    _mark_groq_key_invalid_and_remove(api_key, telegram_user_id)
+                    break
                 if r.status_code == 200:
                     try:
                         answer_text = r.json()["choices"][0]["message"]["content"].strip()
@@ -3386,6 +3556,18 @@ class MiniPixV2:
                 log("🛑 STOP FLAG detected — aborting quiz run.")
                 send_log_sync(f"🛑 QUIZ STOPPED by flag | user={telegram_user_id} at session {session_num}/{max_sessions}")
                 break
+
+            try:
+                _bal_check = self.get_balance_silent()
+                _bal_check_int = int(_bal_check) if _bal_check is not None else 0
+            except Exception:
+                _bal_check_int = 0
+            if 24000 <= _bal_check_int <= 25000:
+                log(f"🛑 Balance {_bal_check_int} in auto-stop range (24000-25000). Stop all sessions.")
+                debug_lines.append(f"[auto-stop] balance {_bal_check_int} in 24000-25000 range.")
+                send_log_sync(f"🛑 QUIZ AUTO-STOP | user={telegram_user_id} | balance={_bal_check_int} in 24000-25000.")
+                break
+
             log(f"--- Session {session_num}/{max_sessions} ---")
 
             prev_hard_ban = bool(isinstance(last_diag, dict) and last_diag.get("hard_ban"))
@@ -5204,6 +5386,26 @@ async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(update.effective_user.id)
     ok = bot.login_with_token(token)
     if ok:
+        try:
+            if not bot.phone:
+                try:
+                    _me_sc, _me_raw = bot._req("GET", "/users/me")
+                    if _me_sc == 200 and isinstance(_me_raw, dict):
+                        _ph = _me_raw.get("mobile") or _me_raw.get("phone")
+                        if _ph:
+                            if not str(_ph).startswith("+"):
+                                _digits = re.sub(r"\D", "", str(_ph))
+                                if len(_digits) == 10:
+                                    _ph = "+91" + _digits
+                                elif len(_digits) == 12 and _digits.startswith("91"):
+                                    _ph = "+" + _digits
+                                else:
+                                    _ph = "+" + _digits if _digits else _ph
+                            bot.phone = _ph
+                except Exception:
+                    pass
+        except Exception:
+            pass
         bot.open_app()
         bal = bot.get_balance()
         try:
@@ -6268,6 +6470,15 @@ def run_multi_account_quiz(
                 bal_before = 0
 
             try:
+                bal_check_int = int(bal_before) if bal_before is not None else 0
+            except Exception:
+                bal_check_int = 0
+            if 24000 <= bal_check_int <= 25000:
+                log(f"🛑 Account {lbl}: Balance {bal_check_int} in auto-stop range (24000-25000). Skip to prevent over-cap.")
+                per_account_summary[lbl]["balance"] = bal_before
+                continue
+
+            try:
                 bot.open_app()
             except Exception:
                 pass
@@ -6521,10 +6732,15 @@ def main():
     login_conv = ConversationHandler( 
         entry_points=[
             CommandHandler("login", login_start),
+            MessageHandler(filters.Regex("^➕ Login$"), login_start),
             CallbackQueryHandler(login_callback, pattern=r"^login:"),
             CommandHandler("tokenlogin", tokenlogin_cmd_start),
         ], 
         states={ 
+            WAIT_PHONE: [ 
+                MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone) 
+            ], 
+            WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp)], 
             WAIT_TOKEN: [ 
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login_token) 
             ], 
